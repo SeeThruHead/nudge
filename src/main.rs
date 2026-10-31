@@ -129,9 +129,10 @@ fn check() -> ExitCode {
     std::thread::sleep(Duration::from_secs(1));
     let sample = sampler.sample();
     config.watches.iter().for_each(|watch| {
-        let state = watch::over(watch, &sample).unwrap_or_else(|| "under its limits".into());
+        let state = watch::over(watch, watch::Level { cpu: sample.cpu, memory: sample.memory })
+            .unwrap_or_else(|| "under its limits".into());
         println!(
-            "{}: CPU {:.0}%, memory {:.0}% now, {state}; trips after {}",
+            "{}: CPU {:.0}%, memory {:.0}% now, {state}; trips when the average over {} is over",
             watch.name,
             sample.cpu,
             sample.memory,

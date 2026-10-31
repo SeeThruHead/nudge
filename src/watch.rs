@@ -20,15 +20,19 @@ pub struct Sample {
     pub busiest: Vec<Usage>,
 }
 
-pub fn over(watch: &Watch, sample: &Sample) -> Option<String> {
-    let cpu = watch
-        .cpu
-        .filter(|limit| sample.cpu > *limit)
-        .map(|limit| format!("CPU {:.0}% (limit {limit:.0}%)", sample.cpu));
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Level {
+    pub cpu: f32,
+    pub memory: f32,
+}
+
+pub fn over(watch: &Watch, level: Level) -> Option<String> {
+    let cpu =
+        watch.cpu.filter(|limit| level.cpu > *limit).map(|limit| format!("CPU {:.0}% (limit {limit:.0}%)", level.cpu));
     let memory = watch
         .memory
-        .filter(|limit| sample.memory > *limit)
-        .map(|limit| format!("memory {:.0}% (limit {limit:.0}%)", sample.memory));
+        .filter(|limit| level.memory > *limit)
+        .map(|limit| format!("memory {:.0}% (limit {limit:.0}%)", level.memory));
     let parts: Vec<String> = cpu.into_iter().chain(memory).collect();
     (!parts.is_empty()).then(|| parts.join(" and "))
 }
@@ -41,8 +45,7 @@ pub enum Change {
 
 #[derive(Debug, Default)]
 pub struct Breaker {
-    over_since: Option<SystemTime>,
-    under_since: Option<SystemTime>,
+    seen: Vec<(SystemTime, Level)>,
     tripped: bool,
 }
 
@@ -50,32 +53,40 @@ fn lasted(since: SystemTime, now: SystemTime, needed: Duration) -> bool {
     now.duration_since(since).is_ok_and(|elapsed| elapsed >= needed)
 }
 
+fn age(at: SystemTime, now: SystemTime) -> Duration {
+    now.duration_since(at).unwrap_or_default()
+}
+
 impl Breaker {
-    pub fn observe(&mut self, watch: &Watch, sample: &Sample, now: SystemTime) -> Option<Change> {
-        match over(watch, sample) {
-            Some(reason) => {
-                self.under_since = None;
-                let since = *self.over_since.get_or_insert(now);
-                if self.tripped || !lasted(since, now, watch.over_for) {
-                    return None;
-                }
-                self.tripped = true;
-                Some(Change::Tripped(reason))
-            }
-            None => {
-                self.over_since = None;
-                if !self.tripped {
-                    return None;
-                }
-                let since = *self.under_since.get_or_insert(now);
-                if !lasted(since, now, watch.clear_for) {
-                    return None;
-                }
-                self.tripped = false;
-                self.under_since = None;
-                Some(Change::Cleared)
-            }
+    fn average(&self, now: SystemTime, span: Duration) -> Option<Level> {
+        if !self.seen.iter().any(|(at, _)| age(*at, now) >= span) {
+            return None;
         }
+        let recent: Vec<Level> =
+            self.seen.iter().filter(|(at, _)| age(*at, now) <= span).map(|(_, level)| *level).collect();
+        let count = recent.len().max(1) as f32;
+        Some(Level {
+            cpu: recent.iter().map(|level| level.cpu).sum::<f32>() / count,
+            memory: recent.iter().map(|level| level.memory).sum::<f32>() / count,
+        })
+    }
+
+    pub fn observe(&mut self, watch: &Watch, sample: &Sample, now: SystemTime) -> Option<Change> {
+        let keep = watch.over_for.max(watch.clear_for) + Duration::from_secs(30);
+        self.seen.retain(|(at, _)| age(*at, now) <= keep);
+        self.seen.push((now, Level { cpu: sample.cpu, memory: sample.memory }));
+        if self.tripped {
+            let level = self.average(now, watch.clear_for)?;
+            if over(watch, level).is_some() {
+                return None;
+            }
+            self.tripped = false;
+            return Some(Change::Cleared);
+        }
+        let reason = over(watch, self.average(now, watch.over_for)?)?;
+        self.tripped = true;
+        self.seen.retain(|(at, _)| *at == now);
+        Some(Change::Tripped(reason))
     }
 }
 
@@ -91,7 +102,7 @@ fn busiest(sample: &Sample, count: usize) -> String {
 
 fn lead(watch: &Watch, sample: &Sample, reason: &str) -> String {
     format!(
-        "[nudge: {}] {} is overloaded: {reason} for {}. Busiest: {}.",
+        "[nudge: {}] {} is overloaded: {reason} on average over the last {}. Busiest now: {}.",
         watch.name,
         sample.host,
         humantime::format_duration(watch.over_for),
@@ -118,7 +129,7 @@ pub fn investigator_text(watch: &Watch, sample: &Sample, reason: &str) -> String
 
 pub fn clear_text(watch: &Watch, sample: &Sample) -> String {
     format!(
-        "[nudge: {}] cleared: {} has been back under its limits for {} (CPU {:.0}%, memory {:.0}%). Heavy work can resume.",
+        "[nudge: {}] cleared: {} has averaged under its limits for {} (CPU {:.0}%, memory {:.0}% now). Heavy work can resume.",
         watch.name,
         sample.host,
         humantime::format_duration(watch.clear_for),
@@ -270,49 +281,48 @@ mod tests {
 
     #[test]
     fn names_each_limit_that_is_over() {
+        let level = |cpu, memory| Level { cpu, memory };
         assert_eq!(
-            [
-                over(&watch(), &sample(94.0, 50.0)),
-                over(&watch(), &sample(94.0, 95.0)),
-                over(&watch(), &sample(40.0, 50.0))
-            ],
+            [over(&watch(), level(94.0, 50.0)), over(&watch(), level(94.0, 95.0)), over(&watch(), level(40.0, 50.0))],
             [Some("CPU 94% (limit 85%)".into()), Some("CPU 94% (limit 85%) and memory 95% (limit 90%)".into()), None]
         );
     }
 
-    #[test]
-    fn trips_only_after_the_limit_holds_and_clears_only_after_it_stays_under() {
-        let mut breaker = Breaker::default();
-        let high = sample(95.0, 50.0);
-        let low = sample(20.0, 50.0);
-        let steps = [
-            breaker.observe(&watch(), &high, at(0)),
-            breaker.observe(&watch(), &low, at(60)),
-            breaker.observe(&watch(), &high, at(70)),
-            breaker.observe(&watch(), &high, at(189)),
-            breaker.observe(&watch(), &high, at(190)),
-            breaker.observe(&watch(), &high, at(400)),
-            breaker.observe(&watch(), &low, at(500)),
-            breaker.observe(&watch(), &high, at(600)),
-            breaker.observe(&watch(), &low, at(700)),
-            breaker.observe(&watch(), &low, at(1000)),
-        ];
+    fn feed(breaker: &mut Breaker, cpus: &[f32], start: u64) -> Vec<Option<Change>> {
+        cpus.iter()
+            .enumerate()
+            .map(|(index, cpu)| breaker.observe(&watch(), &sample(*cpu, 50.0), at(start + index as u64 * 10)))
+            .collect()
+    }
 
-        assert_eq!(
-            steps,
-            [
-                None,
-                None,
-                None,
-                None,
-                Some(Change::Tripped("CPU 95% (limit 85%)".into())),
-                None,
-                None,
-                None,
-                None,
-                Some(Change::Cleared)
-            ]
-        );
+    #[test]
+    fn trips_on_the_average_over_the_window_so_bursty_load_still_counts() {
+        let mut bursty = Breaker::default();
+        let mut light = Breaker::default();
+        let mut steady = Breaker::default();
+        let swings: Vec<f32> = (0..13).map(|index| if index % 2 == 0 { 99.0 } else { 80.0 }).collect();
+
+        let bursts = feed(&mut bursty, &swings, 0);
+        let calm = feed(&mut light, &[90.0, 40.0, 50.0, 60.0, 90.0, 40.0, 50.0, 60.0, 90.0, 40.0, 50.0, 60.0, 90.0], 0);
+        let early = feed(&mut steady, &[95.0; 12], 0);
+
+        assert_eq!(bursts.iter().filter(|change| change.is_some()).count(), 1);
+        assert_eq!(bursts[12], Some(Change::Tripped("CPU 90% (limit 85%)".into())));
+        assert!(calm.iter().all(Option::is_none));
+        assert!(early.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn clears_only_once_the_average_stays_under_for_the_clear_window() {
+        let mut breaker = Breaker::default();
+        let tripped = feed(&mut breaker, &[95.0; 13], 0);
+        let after: Vec<f32> = [vec![95.0; 6], vec![20.0; 30]].concat();
+        let changes = feed(&mut breaker, &after, 130);
+        let cleared_at = changes.iter().position(|change| change == &Some(Change::Cleared));
+
+        assert_eq!(tripped[12], Some(Change::Tripped("CPU 95% (limit 85%)".into())));
+        assert_eq!(changes.iter().filter(|change| change.is_some()).count(), 1);
+        assert!(cleared_at.is_some_and(|index| index > 6 + 15));
     }
 
     struct FakeHerdr {
@@ -374,11 +384,11 @@ mod tests {
         assert_eq!(prompts.last().map(|(pane, _)| pane.as_str()), Some("w3:p1"));
         assert_eq!(
             prompts[0].1,
-            "[nudge: overload] STHMAC is overloaded: CPU 95% (limit 85%) for 2m. Busiest: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so Shane can keep using the computer, and say in a few lines what it was. Shane is gaming."
+            "[nudge: overload] STHMAC is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so Shane can keep using the computer, and say in a few lines what it was. Shane is gaming."
         );
         assert_eq!(
             prompts[1].1,
-            "[nudge: overload] STHMAC is overloaded: CPU 95% (limit 85%) for 2m. Busiest: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Pause heavy work you started (builds, encodes, test runs, containers) and start nothing heavy until nudge says overload has cleared. the agent in /code/homelab is finding out why."
+            "[nudge: overload] STHMAC is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Pause heavy work you started (builds, encodes, test runs, containers) and start nothing heavy until nudge says overload has cleared. the agent in /code/homelab is finding out why."
         );
     }
 
@@ -414,7 +424,7 @@ mod tests {
         );
         assert_eq!(
             clear_text(&watch(), &sample(10.0, 10.0)),
-            "[nudge: overload] cleared: STHMAC has been back under its limits for 5m (CPU 10%, memory 10%). Heavy work can resume."
+            "[nudge: overload] cleared: STHMAC has averaged under its limits for 5m (CPU 10%, memory 10% now). Heavy work can resume."
         );
     }
 }
