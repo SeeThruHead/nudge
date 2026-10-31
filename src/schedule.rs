@@ -146,7 +146,7 @@ mod tests {
     }
 
     fn config() -> Config {
-        Config { jobs: vec![watch()] }
+        Config { jobs: vec![watch()], watches: vec![] }
     }
 
     fn at(minutes: u64) -> SystemTime {

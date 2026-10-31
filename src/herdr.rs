@@ -139,7 +139,10 @@ mod tests {
 
     #[test]
     fn passes_the_pane_and_text_to_herdr_agent_prompt() {
-        let herdr = cli(r#"[ "$1 $2 $3 $4" = "agent prompt w1:pH check encoding" ] || { echo "got $*" >&2; exit 1; }"#, Duration::from_secs(5));
+        let herdr = cli(
+            r#"[ "$1 $2 $3 $4" = "agent prompt w1:pH check encoding" ] || { echo "got $*" >&2; exit 1; }"#,
+            Duration::from_secs(5),
+        );
         assert_eq!(herdr.prompt("w1:pH", "check encoding"), Ok(()));
     }
 

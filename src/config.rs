@@ -28,9 +28,22 @@ pub struct Job {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Watch {
+    pub name: String,
+    pub cpu: Option<f32>,
+    pub memory: Option<f32>,
+    pub over_for: Duration,
+    pub clear_for: Duration,
+    pub investigator: Option<Target>,
+    pub broadcast: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Config {
     pub jobs: Vec<Job>,
+    pub watches: Vec<Watch>,
 }
 
 #[derive(Deserialize)]
@@ -42,11 +55,42 @@ struct RawJob {
     message: String,
 }
 
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWatch {
+    name: String,
+    cpu: Option<f32>,
+    memory: Option<f32>,
+    #[serde(rename = "for", default = "two_minutes")]
+    over_for: String,
+    #[serde(default = "five_minutes")]
+    clear_for: String,
+    investigator: Option<Target>,
+    #[serde(default = "yes")]
+    broadcast: bool,
+    #[serde(default)]
+    message: String,
+}
+
+fn two_minutes() -> String {
+    "2m".into()
+}
+
+fn five_minutes() -> String {
+    "5m".into()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
     job: Vec<RawJob>,
+    #[serde(default)]
+    watch: Vec<RawWatch>,
 }
 
 const SHORTEST: Duration = Duration::from_secs(60);
@@ -63,11 +107,45 @@ fn job(raw: RawJob) -> Result<Job, String> {
     Ok(Job { name: raw.name, every, target: raw.target, message: raw.message.trim().to_string() })
 }
 
-fn unique(jobs: &[Job]) -> Result<(), String> {
-    let mut names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+fn duration(name: &str, key: &str, text: &str) -> Result<Duration, String> {
+    humantime::parse_duration(text).map_err(|e| format!("watch {name}: {key} = {text:?} is not a duration ({e})"))
+}
+
+fn percent(name: &str, key: &str, value: Option<f32>) -> Result<Option<f32>, String> {
+    match value {
+        Some(limit) if !(1.0..=100.0).contains(&limit) => {
+            Err(format!("watch {name}: {key} must be a percent from 1 to 100"))
+        }
+        other => Ok(other),
+    }
+}
+
+fn watch(raw: RawWatch) -> Result<Watch, String> {
+    let cpu = percent(&raw.name, "cpu", raw.cpu)?;
+    let memory = percent(&raw.name, "memory", raw.memory)?;
+    if cpu.is_none() && memory.is_none() {
+        return Err(format!("watch {}: give a cpu or memory limit", raw.name));
+    }
+    if raw.investigator.is_none() && !raw.broadcast {
+        return Err(format!("watch {}: with broadcast = false it needs an investigator", raw.name));
+    }
+    Ok(Watch {
+        over_for: duration(&raw.name, "for", &raw.over_for)?,
+        clear_for: duration(&raw.name, "clear_for", &raw.clear_for)?,
+        name: raw.name,
+        cpu,
+        memory,
+        investigator: raw.investigator,
+        broadcast: raw.broadcast,
+        message: raw.message.trim().to_string(),
+    })
+}
+
+fn unique<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let mut names: Vec<&str> = names.collect();
     names.sort_unstable();
     match names.windows(2).find(|pair| pair[0] == pair[1]) {
-        Some(pair) => Err(format!("two jobs are named {}", pair[0])),
+        Some(pair) => Err(format!("two jobs or watches are named {}", pair[0])),
         None => Ok(()),
     }
 }
@@ -75,8 +153,9 @@ fn unique(jobs: &[Job]) -> Result<(), String> {
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
     let jobs = raw.job.into_iter().map(job).collect::<Result<Vec<_>, _>>()?;
-    unique(&jobs)?;
-    Ok(Config { jobs })
+    let watches = raw.watch.into_iter().map(watch).collect::<Result<Vec<_>, _>>()?;
+    unique(jobs.iter().map(|j| j.name.as_str()).chain(watches.iter().map(|w| w.name.as_str())))?;
+    Ok(Config { jobs, watches })
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -152,7 +231,7 @@ message = "hi"
     #[test]
     fn rejects_two_jobs_with_one_name() {
         let one = "[[job]]\nname = \"x\"\nevery = \"5m\"\ntarget = { agent = \"a\" }\nmessage = \"m\"\n";
-        assert_eq!(parse(&format!("{one}{one}")).unwrap_err(), "two jobs are named x");
+        assert_eq!(parse(&format!("{one}{one}")).unwrap_err(), "two jobs or watches are named x");
     }
 
     #[test]
@@ -161,6 +240,53 @@ message = "hi"
         assert!(parse(target).is_err());
         let key = "[[job]]\nname = \"x\"\nevery = \"5m\"\ntarget = { agent = \"a\" }\nmessage = \"m\"\nevry = \"1m\"\n";
         assert!(parse(key).is_err());
+    }
+
+    #[test]
+    fn reads_a_watch_with_its_limits_durations_and_investigator() {
+        let text = r#"
+[[watch]]
+name = "overload"
+cpu = 85
+memory = 90
+for = "3m"
+investigator = { cwd = "/Users/sth/code/homelab" }
+message = "Shane is gaming tonight."
+"#;
+        assert_eq!(
+            parse(text).unwrap().watches,
+            vec![Watch {
+                name: "overload".into(),
+                cpu: Some(85.0),
+                memory: Some(90.0),
+                over_for: Duration::from_secs(180),
+                clear_for: Duration::from_secs(300),
+                investigator: Some(Target::Cwd("/Users/sth/code/homelab".into())),
+                broadcast: true,
+                message: "Shane is gaming tonight.".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_a_watch_with_no_limit_a_limit_out_of_range_or_nobody_to_tell() {
+        let errors = [
+            "[[watch]]\nname = \"w\"\n",
+            "[[watch]]\nname = \"w\"\ncpu = 150\n",
+            "[[watch]]\nname = \"w\"\ncpu = 80\nbroadcast = false\n",
+            "[[watch]]\nname = \"w\"\ncpu = 80\nfor = \"soon\"\n",
+        ]
+        .map(|text| parse(text).unwrap_err());
+        assert_eq!(errors[0], "watch w: give a cpu or memory limit");
+        assert_eq!(errors[1], "watch w: cpu must be a percent from 1 to 100");
+        assert_eq!(errors[2], "watch w: with broadcast = false it needs an investigator");
+        assert!(errors[3].starts_with("watch w: for = \"soon\" is not a duration"));
+    }
+
+    #[test]
+    fn a_job_and_a_watch_cannot_share_a_name() {
+        let text = "[[job]]\nname = \"x\"\nevery = \"5m\"\ntarget = { agent = \"a\" }\nmessage = \"m\"\n[[watch]]\nname = \"x\"\ncpu = 80\n";
+        assert_eq!(parse(text).unwrap_err(), "two jobs or watches are named x");
     }
 
     #[test]
