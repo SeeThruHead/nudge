@@ -21,10 +21,41 @@ impl std::fmt::Display for Target {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Schedule {
+    Every(Duration),
+    Cron(String),
+    At(Vec<(u32, u32)>),
+}
+
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Schedule::Every(every) => write!(f, "every {}", humantime::format_duration(*every)),
+            Schedule::Cron(pattern) => write!(f, "cron {pattern}"),
+            Schedule::At(times) => write!(
+                f,
+                "at {}",
+                times.iter().map(|(hour, minute)| format!("{hour:02}:{minute:02}")).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    #[default]
+    Host,
+    Claude,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub name: String,
-    pub every: Duration,
+    pub schedule: Schedule,
     pub target: Target,
+    pub via: Via,
+    pub args: Vec<String>,
     pub message: String,
 }
 
@@ -33,6 +64,7 @@ pub struct Watch {
     pub name: String,
     pub cpu: Option<f32>,
     pub memory: Option<f32>,
+    pub load: Option<f32>,
     pub over_for: Duration,
     pub clear_for: Duration,
     pub investigator: Option<Target>,
@@ -40,18 +72,38 @@ pub struct Watch {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    pub host: String,
     pub jobs: Vec<Job>,
     pub watches: Vec<Watch>,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config { host: "auto".into(), jobs: vec![], watches: vec![] }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Times {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawJob {
     name: String,
-    every: String,
+    every: Option<String>,
+    cron: Option<String>,
+    at: Option<Times>,
     target: Target,
+    #[serde(default)]
+    via: Via,
+    #[serde(default)]
+    args: Vec<String>,
     message: String,
 }
 
@@ -65,6 +117,7 @@ struct RawWatch {
     name: String,
     cpu: Option<f32>,
     memory: Option<f32>,
+    load: Option<f32>,
     #[serde(rename = "for", default = "two_minutes")]
     over_for: String,
     #[serde(default = "five_minutes")]
@@ -87,24 +140,88 @@ fn five_minutes() -> String {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    #[serde(default = "auto")]
+    host: String,
     #[serde(default)]
     job: Vec<RawJob>,
     #[serde(default)]
     watch: Vec<RawWatch>,
 }
 
+fn auto() -> String {
+    "auto".into()
+}
+
+const HOSTS: [&str; 5] = ["auto", "herdr", "tmux", "cmux", "orca"];
+
 const SHORTEST: Duration = Duration::from_secs(60);
 
-fn job(raw: RawJob) -> Result<Job, String> {
-    let every = humantime::parse_duration(&raw.every)
-        .map_err(|e| format!("job {}: every = {:?} is not a duration ({e})", raw.name, raw.every))?;
+fn every(name: &str, text: &str) -> Result<Schedule, String> {
+    let every =
+        humantime::parse_duration(text).map_err(|e| format!("job {name}: every = {text:?} is not a duration ({e})"))?;
     if every < SHORTEST {
-        return Err(format!("job {}: every must be at least 1m", raw.name));
+        return Err(format!("job {name}: every must be at least 1m"));
     }
+    Ok(Schedule::Every(every))
+}
+
+fn cron(name: &str, pattern: &str) -> Result<Schedule, String> {
+    croner::Cron::new(pattern)
+        .parse()
+        .map(|_| Schedule::Cron(pattern.trim().to_string()))
+        .map_err(|e| format!("job {name}: cron = {pattern:?} is not a cron pattern ({e})"))
+}
+
+fn clock(name: &str, text: &str) -> Result<(u32, u32), String> {
+    let wrong = || format!("job {name}: at = {text:?} is not a time like \"09:30\"");
+    let (hour, minute) = text.trim().split_once(':').ok_or_else(wrong)?;
+    let hour: u32 = hour.parse().map_err(|_| wrong())?;
+    let minute: u32 = minute.parse().map_err(|_| wrong())?;
+    if hour > 23 || minute > 59 {
+        return Err(wrong());
+    }
+    Ok((hour, minute))
+}
+
+fn at(name: &str, times: Times) -> Result<Schedule, String> {
+    let texts = match times {
+        Times::One(text) => vec![text],
+        Times::Many(texts) => texts,
+    };
+    if texts.is_empty() {
+        return Err(format!("job {name}: at needs at least one time"));
+    }
+    texts.iter().map(|text| clock(name, text)).collect::<Result<Vec<_>, _>>().map(Schedule::At)
+}
+
+fn schedule(raw: &mut RawJob) -> Result<Schedule, String> {
+    match (raw.every.take(), raw.cron.take(), raw.at.take()) {
+        (Some(text), None, None) => every(&raw.name, &text),
+        (None, Some(pattern), None) => cron(&raw.name, &pattern),
+        (None, None, Some(times)) => at(&raw.name, times),
+        _ => Err(format!("job {}: give exactly one of every, cron or at", raw.name)),
+    }
+}
+
+fn job(mut raw: RawJob) -> Result<Job, String> {
+    let schedule = schedule(&mut raw)?;
     if raw.message.trim().is_empty() {
         return Err(format!("job {}: message is empty", raw.name));
     }
-    Ok(Job { name: raw.name, every, target: raw.target, message: raw.message.trim().to_string() })
+    if raw.via == Via::Claude && matches!(raw.target, Target::Agent(_)) {
+        return Err(format!("job {}: via = \"claude\" needs a cwd or session target", raw.name));
+    }
+    if raw.via == Via::Host && !raw.args.is_empty() {
+        return Err(format!("job {}: args are only for via = \"claude\"", raw.name));
+    }
+    Ok(Job {
+        name: raw.name,
+        schedule,
+        target: raw.target,
+        via: raw.via,
+        args: raw.args,
+        message: raw.message.trim().to_string(),
+    })
 }
 
 fn duration(name: &str, key: &str, text: &str) -> Result<Duration, String> {
@@ -120,11 +237,19 @@ fn percent(name: &str, key: &str, value: Option<f32>) -> Result<Option<f32>, Str
     }
 }
 
+fn positive(name: &str, key: &str, value: Option<f32>) -> Result<Option<f32>, String> {
+    match value {
+        Some(limit) if limit <= 0.0 => Err(format!("watch {name}: {key} must be above 0")),
+        other => Ok(other),
+    }
+}
+
 fn watch(raw: RawWatch) -> Result<Watch, String> {
     let cpu = percent(&raw.name, "cpu", raw.cpu)?;
     let memory = percent(&raw.name, "memory", raw.memory)?;
-    if cpu.is_none() && memory.is_none() {
-        return Err(format!("watch {}: give a cpu or memory limit", raw.name));
+    let load = positive(&raw.name, "load", raw.load)?;
+    if cpu.is_none() && memory.is_none() && load.is_none() {
+        return Err(format!("watch {}: give a cpu, memory or load limit", raw.name));
     }
     if raw.investigator.is_none() && !raw.broadcast {
         return Err(format!("watch {}: with broadcast = false it needs an investigator", raw.name));
@@ -135,6 +260,7 @@ fn watch(raw: RawWatch) -> Result<Watch, String> {
         name: raw.name,
         cpu,
         memory,
+        load,
         investigator: raw.investigator,
         broadcast: raw.broadcast,
         message: raw.message.trim().to_string(),
@@ -152,10 +278,13 @@ fn unique<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), String> {
 
 pub fn parse(text: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+    if !HOSTS.contains(&raw.host.as_str()) {
+        return Err(format!("host = {:?} is not one of {}", raw.host, HOSTS.join(", ")));
+    }
     let jobs = raw.job.into_iter().map(job).collect::<Result<Vec<_>, _>>()?;
     let watches = raw.watch.into_iter().map(watch).collect::<Result<Vec<_>, _>>()?;
     unique(jobs.iter().map(|j| j.name.as_str()).chain(watches.iter().map(|w| w.name.as_str())))?;
-    Ok(Config { jobs, watches })
+    Ok(Config { host: raw.host, jobs, watches })
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -171,7 +300,7 @@ mod tests {
 [[job]]
 name = "encode-watch"
 every = "30m"
-target = { cwd = "/Users/sth/code/homelab" }
+target = { cwd = "/Users/me/code/ops" }
 message = """
 Check that encoding is running.
 """
@@ -191,14 +320,18 @@ message = "hi"
             vec![
                 Job {
                     name: "encode-watch".into(),
-                    every: Duration::from_secs(30 * 60),
-                    target: Target::Cwd("/Users/sth/code/homelab".into()),
+                    schedule: Schedule::Every(Duration::from_secs(30 * 60)),
+                    target: Target::Cwd("/Users/me/code/ops".into()),
+                    via: Via::Host,
+                    args: vec![],
                     message: "Check that encoding is running.".into(),
                 },
                 Job {
                     name: "by-name".into(),
-                    every: Duration::from_secs(90 * 60),
+                    schedule: Schedule::Every(Duration::from_secs(90 * 60)),
                     target: Target::Agent("homelab".into()),
+                    via: Via::Host,
+                    args: vec![],
                     message: "hi".into(),
                 },
             ]
@@ -208,6 +341,60 @@ message = "hi"
     #[test]
     fn an_empty_file_has_no_jobs() {
         assert_eq!(parse("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn reads_cron_and_daily_schedules_the_host_and_direct_claude_jobs() {
+        let text = r#"
+host = "tmux"
+
+[[job]]
+name = "standup"
+cron = "0 9 * * 1-5"
+target = { cwd = "/code/app" }
+message = "Summarise yesterday."
+
+[[job]]
+name = "twice"
+at = ["09:00", "17:30"]
+target = { session = "abc" }
+via = "claude"
+args = ["--permission-mode", "acceptEdits"]
+message = "Check the build."
+"#;
+        let config = parse(text).unwrap();
+
+        assert_eq!(config.host, "tmux");
+        assert_eq!(config.jobs[0].schedule, Schedule::Cron("0 9 * * 1-5".into()));
+        assert_eq!(config.jobs[1].schedule, Schedule::At(vec![(9, 0), (17, 30)]));
+        assert_eq!(config.jobs[1].via, Via::Claude);
+        assert_eq!(config.jobs[1].args, ["--permission-mode", "acceptEdits"]);
+        assert_eq!(config.jobs[1].schedule.to_string(), "at 09:00, 17:30");
+        assert_eq!(parse("").unwrap().host, "auto");
+    }
+
+    #[test]
+    fn rejects_schedules_hosts_and_claude_jobs_that_cannot_work() {
+        let job =
+            |extra: &str| format!("[[job]]\nname = \"x\"\ntarget = {{ agent = \"a\" }}\nmessage = \"m\"\n{extra}");
+        let errors = [
+            job(""),
+            job("every = \"5m\"\ncron = \"0 9 * * *\"\n"),
+            job("cron = \"every tuesday\"\n"),
+            job("at = \"25:00\"\n"),
+            job("every = \"5m\"\nvia = \"claude\"\n"),
+            job("every = \"5m\"\nargs = [\"-x\"]\n"),
+            "host = \"screen\"\n".to_string(),
+        ]
+        .map(|text| parse(&text).unwrap_err());
+
+        assert_eq!(errors[0], "job x: give exactly one of every, cron or at");
+        assert_eq!(errors[1], "job x: give exactly one of every, cron or at");
+        assert!(errors[2].starts_with("job x: cron = \"every tuesday\" is not a cron pattern"));
+        assert_eq!(errors[3], "job x: at = \"25:00\" is not a time like \"09:30\"");
+        assert_eq!(errors[4], "job x: via = \"claude\" needs a cwd or session target");
+        assert_eq!(errors[5], "job x: args are only for via = \"claude\"");
+        assert!(errors[6].starts_with("host = \"screen\" is not one of"));
     }
 
     #[test]
@@ -249,9 +436,10 @@ message = "hi"
 name = "overload"
 cpu = 85
 memory = 90
+load = 12
 for = "3m"
-investigator = { cwd = "/Users/sth/code/homelab" }
-message = "Shane is gaming tonight."
+investigator = { cwd = "/Users/me/code/ops" }
+message = "Someone is gaming tonight."
 "#;
         assert_eq!(
             parse(text).unwrap().watches,
@@ -259,11 +447,12 @@ message = "Shane is gaming tonight."
                 name: "overload".into(),
                 cpu: Some(85.0),
                 memory: Some(90.0),
+                load: Some(12.0),
                 over_for: Duration::from_secs(180),
                 clear_for: Duration::from_secs(300),
-                investigator: Some(Target::Cwd("/Users/sth/code/homelab".into())),
+                investigator: Some(Target::Cwd("/Users/me/code/ops".into())),
                 broadcast: true,
-                message: "Shane is gaming tonight.".into(),
+                message: "Someone is gaming tonight.".into(),
             }]
         );
     }
@@ -275,12 +464,14 @@ message = "Shane is gaming tonight."
             "[[watch]]\nname = \"w\"\ncpu = 150\n",
             "[[watch]]\nname = \"w\"\ncpu = 80\nbroadcast = false\n",
             "[[watch]]\nname = \"w\"\ncpu = 80\nfor = \"soon\"\n",
+            "[[watch]]\nname = \"w\"\nload = 0\n",
         ]
         .map(|text| parse(text).unwrap_err());
-        assert_eq!(errors[0], "watch w: give a cpu or memory limit");
+        assert_eq!(errors[0], "watch w: give a cpu, memory or load limit");
         assert_eq!(errors[1], "watch w: cpu must be a percent from 1 to 100");
         assert_eq!(errors[2], "watch w: with broadcast = false it needs an investigator");
         assert!(errors[3].starts_with("watch w: for = \"soon\" is not a duration"));
+        assert_eq!(errors[4], "watch w: load must be above 0");
     }
 
     #[test]

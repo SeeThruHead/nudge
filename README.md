@@ -1,63 +1,131 @@
 # nudge
 
-Sends messages to coding agents running in Herdr panes: on a schedule (jobs), and when this machine is
-overloaded (watches), so a session can be told to check on something every so often, and every session
-can be told to back off when the computer is struggling. One small Rust binary run by launchd or systemd; it
-talks to Herdr through `herdr agent list` and `herdr agent prompt`.
+A scheduler for coding agents. nudge sends a prompt to an agent on a schedule (every 30 minutes, at 09:00,
+or any cron pattern), and when the machine stays overloaded it tells every agent to pause heavy work and has
+one of them find out why.
 
-- `nudge run` reads `~/.config/nudge/config.toml` every 30 seconds and sends each job's message when
-  it is due. The first send is one interval after start. A busy agent (working or blocked) is waited
-  for, never interrupted; the message goes out as soon as it is idle.
-- Every 5 seconds it also checks each watch. When CPU or memory stays over a watch's limit for `for`, the
-  watch trips: every agent on the machine is told what is using it and to pause heavy work, and the
-  investigator (if set) is told to find out why and fix it. Once usage stays back under for `clear_for`,
-  everyone is told it has cleared. These messages go to busy agents too (the busy one is usually the cause);
-  one that is blocked gets it as soon as it can take input, or is given up on after 15 minutes. Memory is
-  macOS's own figure (`kern.memorystatus_level`, as `memory_pressure` shows) on a Mac, and the share of RAM
-  not available on Linux.
-- `nudge send <job>` sends one job's message now. `nudge check` shows where each job would go and how each
-  watch stands right now.
+It reaches agents where they already run:
 
-```toml
-[[job]]
-name = "encode-watch"
-every = "30m"
-target = { cwd = "/Users/sth/code/homelab" }   # or { agent = "name" }, or { session = "id" }
-message = "Check that encoding is running."
+| Host     | Finds agents by                                                          | Sends with                                 |
+| -------- | ------------------------------------------------------------------------ | ------------------------------------------ |
+| `herdr`  | `herdr agent list` (status, folder, name, session)                       | `herdr agent prompt`                       |
+| `cmux`   | each workspace's sidebar state (Claude Code, Codex, OpenCode, Gemini)    | a bracketed paste, then Enter              |
+| `orca`   | `orca terminal list --json` (terminals with an agent identity)           | `orca terminal send --enter`               |
+| `tmux`   | panes running a known agent (`claude`, `codex`, `opencode`, `gemini`, `pi`, `amp`, `aider`, `cursor-agent`, plus `NUDGE_AGENT_COMMANDS`) | a bracketed paste, then Enter |
+| `claude` | no multiplexer: `claude -p` in a session (`--resume`) or folder (`--continue`) | a headless Claude Code turn            |
+
+`host = "auto"` (the default) uses the first of herdr, cmux, orca and tmux that answers. A job with
+`via = "claude"` skips the host and runs Claude Code directly.
+
+A busy agent is waited for, never interrupted: the message goes out once it is idle. tmux cannot tell whether
+an agent is busy, so there the message is pasted right away and the agent queues it. A target that matches
+no agent, or more than one, is logged and retried; nothing is guessed.
+
+## Install
+
+```sh
+brew install seethruhead/tap/nudge
+brew services start nudge
 ```
 
+Or build it: `cargo install --locked --path .`, then run `nudge run` under launchd or systemd (see below).
+
+## Configure
+
+`~/.config/nudge/config.toml` (or `$NUDGE_CONFIG`). nudge rereads it every few seconds, so edits apply
+without a restart.
+
 ```toml
+host = "auto"                                  # or herdr, tmux, cmux, orca
+
+[[job]]
+name = "ci-check"
+every = "30m"                                  # at least 1m
+target = { cwd = "/Users/me/code/app" }        # or { agent = "name" }, or { session = "id" }
+message = "Check CI on main and fix what is red."
+
+[[job]]
+name = "standup"
+cron = "0 9 * * 1-5"                           # local time; 5 fields, or 6 with seconds
+target = { agent = "api" }
+message = "Summarise what changed since yesterday."
+
+[[job]]
+name = "evening-review"
+at = ["12:30", "17:30"]                        # daily, local time
+target = { session = "4f1c2e9a-8a7d-4b55-9d0e-0c1f7f0f2c11" }
+via = "claude"                                 # run claude -p --resume <session>, no multiplexer
+args = ["--permission-mode", "acceptEdits"]    # extra claude arguments
+message = "Review today's commits for anything risky."
+
 [[watch]]
 name = "overload"
-cpu = 85                                           # percent of the whole machine; either limit is optional
-memory = 92                                        # percent in use
-for = "2m"                                         # how long it must stay over before tripping (default 2m)
-clear_for = "5m"                                   # how long under before it clears (default 5m)
-investigator = { cwd = "/Users/sth/code/homelab" } # who finds out why; any target works
-broadcast = true                                   # tell every agent too (default true)
+cpu = 85                                       # percent of the whole machine
+memory = 92                                    # percent in use
+load = 12                                      # 1-minute load average; about 1.2 x cores
+for = "1m"                                     # how long the average must stay over (default 2m)
+clear_for = "5m"                               # how long under before it clears (default 5m)
+investigator = { cwd = "/Users/me/code/ops" }  # who finds out why; any target works
+broadcast = true                               # tell every agent too (default true)
 message = "Extra instructions for the investigator."
 ```
 
-A target that matches no agent, or more than one, is logged and retried; nothing is guessed.
+Each message starts with `[nudge: <job>, <schedule>]` so the agent knows where it came from. A `via = "claude"`
+job waits while its previous run is still going, and appends Claude's output to
+`~/.local/state/nudge/<job>.log`.
 
-Install: `cargo build --release`, copy `target/release/nudge` to `~/.local/bin`, then
-`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/vip.sthloc.nudge.plist`. Logs go to
-`~/Library/Logs/nudge.log`.
+A watch averages the machine's CPU, memory and load over `for` and trips when any limit is over: every agent
+is told what is using the machine and to pause heavy work, and the investigator is told to find out why and
+fix it. Load matters most for "I can't click anything": a burst of test runs can queue far more work than
+there are cores while CPU averages just under 85%. Memory is macOS's own figure (`kern.memorystatus_level`)
+on a Mac and the share of RAM not available on Linux.
 
-On Linux, copy the binary to `~/.local/bin` and run it as a systemd user service:
+## Commands
+
+```text
+nudge run           read the config, send each job when it is due, check each watch
+nudge send <job>    send one job's message now
+nudge check         show the host, where each job goes and when it runs next, and how each watch stands
+nudge --version
+```
+
+Binaries are found on `PATH`, `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`; set `NUDGE_HERDR`,
+`NUDGE_TMUX`, `NUDGE_CMUX`, `NUDGE_ORCA` or `NUDGE_CLAUDE` to choose one.
+
+## Run it as a service without Homebrew
+
+macOS, `~/Library/LaunchAgents/nudge.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>nudge</string>
+  <key>ProgramArguments</key><array><string>/Users/me/.cargo/bin/nudge</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>/Users/me/Library/Logs/nudge.log</string>
+</dict></plist>
+```
+
+then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/nudge.plist`.
+
+Linux, `~/.config/systemd/user/nudge.service`:
 
 ```ini
-# ~/.config/systemd/user/nudge.service
 [Unit]
 Description=nudge
 
 [Service]
-ExecStart=%h/.local/bin/nudge run
+ExecStart=%h/.cargo/bin/nudge run
 Restart=always
 
 [Install]
 WantedBy=default.target
 ```
 
-then `systemctl --user enable --now nudge` (and `loginctl enable-linger $USER` to keep it running without a
-login). `journalctl --user -u nudge` shows its log.
+then `systemctl --user enable --now nudge`.
+
+## License
+
+MIT

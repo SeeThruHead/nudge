@@ -1,5 +1,6 @@
-use crate::config::{Config, Job, Target};
-use crate::herdr::{Agent, Herdr};
+use crate::config::{Config, Job, Schedule, Target, Via};
+use crate::host::{Agent, Host};
+use chrono::{DateTime, Days, Local, NaiveTime, TimeZone};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -20,7 +21,7 @@ fn is_target(target: &Target, agent: &Agent) -> bool {
 }
 
 fn is_ready(agent: &Agent) -> bool {
-    agent.agent_status == "idle" || agent.agent_status == "done"
+    agent.agent_status == "idle" || agent.agent_status == "done" || agent.agent_status == "unknown"
 }
 
 pub fn pick<'a>(target: &Target, agents: &'a [Agent]) -> Pick<'a> {
@@ -34,7 +35,36 @@ pub fn pick<'a>(target: &Target, agents: &'a [Agent]) -> Pick<'a> {
 }
 
 pub fn text(job: &Job) -> String {
-    format!("[nudge: {}, every {}] {}", job.name, humantime::format_duration(job.every), job.message)
+    format!("[nudge: {}, {}] {}", job.name, job.schedule, job.message)
+}
+
+fn daily(times: &[(u32, u32)], after: DateTime<Local>) -> Option<DateTime<Local>> {
+    let days = [after.date_naive(), after.date_naive().checked_add_days(Days::new(1))?];
+    days.iter()
+        .flat_map(|day| {
+            times
+                .iter()
+                .filter_map(move |(hour, minute)| Some(day.and_time(NaiveTime::from_hms_opt(*hour, *minute, 0)?)))
+        })
+        .filter_map(|moment| Local.from_local_datetime(&moment).earliest())
+        .filter(|moment| *moment > after)
+        .min()
+}
+
+pub fn next_after(schedule: &Schedule, now: SystemTime) -> SystemTime {
+    let local: DateTime<Local> = now.into();
+    let next = match schedule {
+        Schedule::Every(every) => return now + *every,
+        Schedule::Cron(pattern) => {
+            croner::Cron::new(pattern).parse().ok().and_then(|cron| cron.find_next_occurrence(&local, false).ok())
+        }
+        Schedule::At(times) => daily(times, local),
+    };
+    next.map(SystemTime::from).unwrap_or(now + std::time::Duration::from_secs(24 * 60 * 60))
+}
+
+pub trait Direct {
+    fn send(&self, job: &Job, text: &str) -> Result<String, String>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,13 +73,19 @@ pub enum Outcome {
     Waiting(String),
 }
 
-pub fn attempt(job: &Job, herdr: &impl Herdr) -> Outcome {
-    let agents = match herdr.agents() {
+pub fn attempt(job: &Job, host: &dyn Host, direct: &dyn Direct) -> Outcome {
+    if job.via == Via::Claude {
+        return match direct.send(job, &text(job)) {
+            Ok(sent) => Outcome::Sent(sent),
+            Err(reason) => Outcome::Waiting(reason),
+        };
+    }
+    let agents = match host.agents() {
         Ok(agents) => agents,
         Err(error) => return Outcome::Waiting(error),
     };
     match pick(&job.target, &agents) {
-        Pick::Ready(agent) => match herdr.prompt(&agent.pane_id, &text(job)) {
+        Pick::Ready(agent) => match host.prompt(&agent.pane_id, &text(job)) {
             Ok(()) => Outcome::Sent(agent.pane_id.clone()),
             Err(error) => Outcome::Waiting(error),
         },
@@ -66,19 +102,19 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn tick(&mut self, now: SystemTime, config: &Config, herdr: &impl Herdr) -> Vec<String> {
+    pub fn tick(&mut self, now: SystemTime, config: &Config, host: &dyn Host, direct: &dyn Direct) -> Vec<String> {
         self.due.retain(|name, _| config.jobs.iter().any(|job| &job.name == name));
-        config.jobs.iter().filter_map(|job| self.run(job, now, herdr)).collect()
+        config.jobs.iter().filter_map(|job| self.run(job, now, host, direct)).collect()
     }
 
-    fn run(&mut self, job: &Job, now: SystemTime, herdr: &impl Herdr) -> Option<String> {
-        let due = *self.due.entry(job.name.clone()).or_insert(now + job.every);
+    fn run(&mut self, job: &Job, now: SystemTime, host: &dyn Host, direct: &dyn Direct) -> Option<String> {
+        let due = *self.due.entry(job.name.clone()).or_insert_with(|| next_after(&job.schedule, now));
         if now < due {
             return None;
         }
-        match attempt(job, herdr) {
+        match attempt(job, host, direct) {
             Outcome::Sent(pane) => {
-                self.due.insert(job.name.clone(), now + job.every);
+                self.due.insert(job.name.clone(), next_after(&job.schedule, now));
                 self.waiting.remove(&job.name);
                 Some(format!("{}: sent to {pane}", job.name))
             }
@@ -94,7 +130,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::Session;
+    use crate::host::Session;
     use std::cell::RefCell;
     use std::time::Duration;
 
@@ -123,7 +159,7 @@ mod tests {
         }
     }
 
-    impl Herdr for FakeHerdr {
+    impl Host for FakeHerdr {
         fn agents(&self) -> Result<Vec<Agent>, String> {
             self.agents.borrow().clone()
         }
@@ -139,18 +175,79 @@ mod tests {
     fn watch() -> Job {
         Job {
             name: "encode-watch".into(),
-            every: Duration::from_secs(30 * 60),
+            schedule: Schedule::Every(Duration::from_secs(30 * 60)),
             target: Target::Cwd("/code/homelab".into()),
+            via: Via::Host,
+            args: vec![],
             message: "Is encoding running?".into(),
         }
     }
 
     fn config() -> Config {
-        Config { jobs: vec![watch()], watches: vec![] }
+        Config { jobs: vec![watch()], ..Config::default() }
+    }
+
+    struct NoDirect;
+    impl Direct for NoDirect {
+        fn send(&self, _: &Job, _: &str) -> Result<String, String> {
+            Err("not used".into())
+        }
+    }
+
+    struct FakeClaude(RefCell<Vec<String>>, bool);
+    impl Direct for FakeClaude {
+        fn send(&self, job: &Job, text: &str) -> Result<String, String> {
+            if self.1 {
+                return Err(format!("{}: the last claude run is still going", job.name));
+            }
+            self.0.borrow_mut().push(text.into());
+            Ok("claude (pid 42)".into())
+        }
     }
 
     fn at(minutes: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(minutes * 60)
+    }
+
+    impl Scheduler {
+        fn tick_with(&mut self, now: SystemTime, config: &Config, host: &dyn Host) -> Vec<String> {
+            self.tick(now, config, host, &NoDirect)
+        }
+    }
+
+    fn local(text: &str) -> SystemTime {
+        let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M").unwrap();
+        Local.from_local_datetime(&naive).earliest().unwrap().into()
+    }
+
+    #[test]
+    fn a_cron_or_daily_job_is_due_at_its_next_local_time() {
+        let monday_night = local("2026-11-02 22:00");
+        let weekdays = Schedule::Cron("0 9 * * 1-5".into());
+        let twice = Schedule::At(vec![(9, 0), (17, 30)]);
+
+        assert_eq!(next_after(&weekdays, monday_night), local("2026-11-03 09:00"));
+        assert_eq!(next_after(&weekdays, local("2026-11-06 10:00")), local("2026-11-09 09:00"));
+        assert_eq!(next_after(&twice, local("2026-11-03 10:00")), local("2026-11-03 17:30"));
+        assert_eq!(next_after(&twice, monday_night), local("2026-11-03 09:00"));
+    }
+
+    #[test]
+    fn a_claude_job_goes_straight_to_claude_code_without_a_host_and_waits_while_the_last_run_goes() {
+        let claude_job = Job { via: Via::Claude, ..watch() };
+        let config = Config { jobs: vec![claude_job.clone()], ..Config::default() };
+        let nobody = FakeHerdr { agents: RefCell::new(Err("no host".into())), ..FakeHerdr::with(vec![]) };
+        let claude = FakeClaude(RefCell::new(vec![]), false);
+        let busy = FakeClaude(RefCell::new(vec![]), true);
+        let mut scheduler = Scheduler::default();
+        scheduler.tick(at(0), &config, &nobody, &claude);
+
+        assert_eq!(scheduler.tick(at(30), &config, &nobody, &claude), vec!["encode-watch: sent to claude (pid 42)"]);
+        assert_eq!(*claude.0.borrow(), vec![text(&claude_job)]);
+        assert_eq!(
+            scheduler.tick(at(60), &config, &nobody, &busy),
+            vec!["encode-watch: waiting, encode-watch: the last claude run is still going"]
+        );
     }
 
     #[test]
@@ -193,11 +290,11 @@ mod tests {
         let herdr = FakeHerdr::with(vec![agent("w1:pH", "idle", "/code/homelab")]);
         let mut scheduler = Scheduler::default();
 
-        assert!(scheduler.tick(at(0), &config(), &herdr).is_empty());
-        assert!(scheduler.tick(at(29), &config(), &herdr).is_empty());
-        assert_eq!(scheduler.tick(at(30), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
-        assert!(scheduler.tick(at(31), &config(), &herdr).is_empty());
-        assert_eq!(scheduler.tick(at(60), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
+        assert!(scheduler.tick_with(at(0), &config(), &herdr).is_empty());
+        assert!(scheduler.tick_with(at(29), &config(), &herdr).is_empty());
+        assert_eq!(scheduler.tick_with(at(30), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
+        assert!(scheduler.tick_with(at(31), &config(), &herdr).is_empty());
+        assert_eq!(scheduler.tick_with(at(60), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
         assert_eq!(
             *herdr.prompts.borrow(),
             vec![("w1:pH".to_string(), text(&watch())), ("w1:pH".to_string(), text(&watch()))]
@@ -208,37 +305,37 @@ mod tests {
     fn waits_for_a_busy_agent_instead_of_interrupting_it_and_logs_the_wait_once() {
         let herdr = FakeHerdr::with(vec![agent("w1:pH", "working", "/code/homelab")]);
         let mut scheduler = Scheduler::default();
-        scheduler.tick(at(0), &config(), &herdr);
+        scheduler.tick_with(at(0), &config(), &herdr);
 
         assert_eq!(
-            scheduler.tick(at(30), &config(), &herdr),
+            scheduler.tick_with(at(30), &config(), &herdr),
             vec!["encode-watch: waiting, the agent in /code/homelab is working"]
         );
-        assert!(scheduler.tick(at(31), &config(), &herdr).is_empty());
+        assert!(scheduler.tick_with(at(31), &config(), &herdr).is_empty());
         herdr.set(vec![agent("w1:pH", "idle", "/code/homelab")]);
-        assert_eq!(scheduler.tick(at(32), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
-        assert!(scheduler.tick(at(61), &config(), &herdr).is_empty());
-        assert_eq!(scheduler.tick(at(62), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
+        assert_eq!(scheduler.tick_with(at(32), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
+        assert!(scheduler.tick_with(at(61), &config(), &herdr).is_empty());
+        assert_eq!(scheduler.tick_with(at(62), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
     }
 
     #[test]
     fn says_why_when_there_is_no_agent_to_send_to_or_herdr_fails() {
         let mut scheduler = Scheduler::default();
         let nobody = FakeHerdr::with(vec![]);
-        scheduler.tick(at(0), &config(), &nobody);
+        scheduler.tick_with(at(0), &config(), &nobody);
         assert_eq!(
-            scheduler.tick(at(30), &config(), &nobody),
+            scheduler.tick_with(at(30), &config(), &nobody),
             vec!["encode-watch: waiting, no agent matches the agent in /code/homelab"]
         );
 
         let down = FakeHerdr { agents: RefCell::new(Err("herdr is not running".into())), ..FakeHerdr::with(vec![]) };
-        assert_eq!(scheduler.tick(at(31), &config(), &down), vec!["encode-watch: waiting, herdr is not running"]);
+        assert_eq!(scheduler.tick_with(at(31), &config(), &down), vec!["encode-watch: waiting, herdr is not running"]);
 
         let refusing = FakeHerdr {
             refuse: Some("agent_blocked".into()),
             ..FakeHerdr::with(vec![agent("w1:pH", "idle", "/code/homelab")])
         };
-        assert_eq!(scheduler.tick(at(32), &config(), &refusing), vec!["encode-watch: waiting, agent_blocked"]);
+        assert_eq!(scheduler.tick_with(at(32), &config(), &refusing), vec!["encode-watch: waiting, agent_blocked"]);
     }
 
     #[test]
@@ -246,9 +343,9 @@ mod tests {
         let herdr =
             FakeHerdr::with(vec![agent("w1:p1", "idle", "/code/homelab"), agent("w2:p1", "idle", "/code/homelab")]);
         let mut scheduler = Scheduler::default();
-        scheduler.tick(at(0), &config(), &herdr);
+        scheduler.tick_with(at(0), &config(), &herdr);
         assert_eq!(
-            scheduler.tick(at(30), &config(), &herdr),
+            scheduler.tick_with(at(30), &config(), &herdr),
             vec!["encode-watch: waiting, 2 agents match the agent in /code/homelab, name one instead"]
         );
         assert!(herdr.prompts.borrow().is_empty());
@@ -258,10 +355,10 @@ mod tests {
     fn a_job_removed_from_the_config_and_added_back_starts_a_fresh_interval() {
         let herdr = FakeHerdr::with(vec![agent("w1:pH", "idle", "/code/homelab")]);
         let mut scheduler = Scheduler::default();
-        scheduler.tick(at(0), &config(), &herdr);
-        scheduler.tick(at(10), &Config::default(), &herdr);
+        scheduler.tick_with(at(0), &config(), &herdr);
+        scheduler.tick_with(at(10), &Config::default(), &herdr);
 
-        assert!(scheduler.tick(at(30), &config(), &herdr).is_empty());
-        assert_eq!(scheduler.tick(at(60), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
+        assert!(scheduler.tick_with(at(30), &config(), &herdr).is_empty());
+        assert_eq!(scheduler.tick_with(at(60), &config(), &herdr), vec!["encode-watch: sent to w1:pH"]);
     }
 }

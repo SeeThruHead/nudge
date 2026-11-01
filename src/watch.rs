@@ -1,5 +1,5 @@
 use crate::config::{Config, Watch};
-use crate::herdr::Herdr;
+use crate::host::Host;
 use crate::schedule::{Pick, pick};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -17,6 +17,7 @@ pub struct Sample {
     pub host: String,
     pub cpu: f32,
     pub memory: f32,
+    pub load: f32,
     pub busiest: Vec<Usage>,
 }
 
@@ -24,6 +25,7 @@ pub struct Sample {
 pub struct Level {
     pub cpu: f32,
     pub memory: f32,
+    pub load: f32,
 }
 
 pub fn over(watch: &Watch, level: Level) -> Option<String> {
@@ -33,7 +35,11 @@ pub fn over(watch: &Watch, level: Level) -> Option<String> {
         .memory
         .filter(|limit| level.memory > *limit)
         .map(|limit| format!("memory {:.0}% (limit {limit:.0}%)", level.memory));
-    let parts: Vec<String> = cpu.into_iter().chain(memory).collect();
+    let load = watch
+        .load
+        .filter(|limit| level.load > *limit)
+        .map(|limit| format!("load {:.1} (limit {limit:.0})", level.load));
+    let parts: Vec<String> = cpu.into_iter().chain(memory).chain(load).collect();
     (!parts.is_empty()).then(|| parts.join(" and "))
 }
 
@@ -68,13 +74,14 @@ impl Breaker {
         Some(Level {
             cpu: recent.iter().map(|level| level.cpu).sum::<f32>() / count,
             memory: recent.iter().map(|level| level.memory).sum::<f32>() / count,
+            load: recent.iter().map(|level| level.load).sum::<f32>() / count,
         })
     }
 
     pub fn observe(&mut self, watch: &Watch, sample: &Sample, now: SystemTime) -> Option<Change> {
         let keep = watch.over_for.max(watch.clear_for) + Duration::from_secs(30);
         self.seen.retain(|(at, _)| age(*at, now) <= keep);
-        self.seen.push((now, Level { cpu: sample.cpu, memory: sample.memory }));
+        self.seen.push((now, Level { cpu: sample.cpu, memory: sample.memory, load: sample.load }));
         if self.tripped {
             let level = self.average(now, watch.clear_for)?;
             if over(watch, level).is_some() {
@@ -122,19 +129,20 @@ pub fn broadcast_text(watch: &Watch, sample: &Sample, reason: &str) -> String {
 pub fn investigator_text(watch: &Watch, sample: &Sample, reason: &str) -> String {
     let extra = if watch.message.is_empty() { String::new() } else { format!(" {}", watch.message) };
     format!(
-        "{} Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so Shane can keep using the computer, and say in a few lines what it was.{extra}",
+        "{} Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so whoever is using the computer can keep working, and say in a few lines what it was.{extra}",
         lead(watch, sample, reason)
     )
 }
 
 pub fn clear_text(watch: &Watch, sample: &Sample) -> String {
     format!(
-        "[nudge: {}] cleared: {} has averaged under its limits for {} (CPU {:.0}%, memory {:.0}% now). Heavy work can resume.",
+        "[nudge: {}] cleared: {} has averaged under its limits for {} (CPU {:.0}%, memory {:.0}%, load {:.1} now). Heavy work can resume.",
         watch.name,
         sample.host,
         humantime::format_duration(watch.clear_for),
         sample.cpu,
-        sample.memory
+        sample.memory,
+        sample.load
     )
 }
 
@@ -154,7 +162,7 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    pub fn tick(&mut self, now: SystemTime, config: &Config, sample: &Sample, herdr: &impl Herdr) -> Vec<String> {
+    pub fn tick(&mut self, now: SystemTime, config: &Config, sample: &Sample, herdr: &dyn Host) -> Vec<String> {
         self.breakers.retain(|name, _| config.watches.iter().any(|watch| &watch.name == name));
         let changes: Vec<String> = config
             .watches
@@ -174,7 +182,7 @@ impl Watcher {
         sample: &Sample,
         change: Change,
         now: SystemTime,
-        herdr: &impl Herdr,
+        herdr: &dyn Host,
     ) -> Vec<String> {
         let agents = match herdr.agents() {
             Ok(agents) => agents,
@@ -227,7 +235,7 @@ impl Watcher {
         std::iter::once(summary).chain(missing).collect()
     }
 
-    fn deliver(&mut self, now: SystemTime, herdr: &impl Herdr) -> Vec<String> {
+    fn deliver(&mut self, now: SystemTime, herdr: &dyn Host) -> Vec<String> {
         let (log, keep): (Vec<Option<String>>, Vec<Option<Pending>>) = std::mem::take(&mut self.outbox)
             .into_iter()
             .map(|pending| match herdr.prompt(&pending.pane, &pending.text) {
@@ -247,7 +255,7 @@ impl Watcher {
 mod tests {
     use super::*;
     use crate::config::Target;
-    use crate::herdr::Agent;
+    use crate::host::Agent;
     use std::cell::RefCell;
 
     fn watch() -> Watch {
@@ -255,19 +263,25 @@ mod tests {
             name: "overload".into(),
             cpu: Some(85.0),
             memory: Some(90.0),
+            load: Some(12.0),
             over_for: Duration::from_secs(120),
             clear_for: Duration::from_secs(300),
             investigator: Some(Target::Cwd("/code/homelab".into())),
             broadcast: true,
-            message: "Shane is gaming.".into(),
+            message: "Someone is gaming.".into(),
         }
     }
 
     fn sample(cpu: f32, memory: f32) -> Sample {
+        loaded(cpu, memory, 2.0)
+    }
+
+    fn loaded(cpu: f32, memory: f32, load: f32) -> Sample {
         Sample {
-            host: "STHMAC".into(),
+            host: "the-mac".into(),
             cpu,
             memory,
+            load,
             busiest: vec![
                 Usage { name: "ffmpeg".into(), pid: 41, cpu: 780.0, memory_mb: 900 },
                 Usage { name: "dagger".into(), pid: 7, cpu: 120.0, memory_mb: 2100 },
@@ -281,11 +295,30 @@ mod tests {
 
     #[test]
     fn names_each_limit_that_is_over() {
-        let level = |cpu, memory| Level { cpu, memory };
+        let level = |cpu, memory, load| Level { cpu, memory, load };
         assert_eq!(
-            [over(&watch(), level(94.0, 50.0)), over(&watch(), level(94.0, 95.0)), over(&watch(), level(40.0, 50.0))],
-            [Some("CPU 94% (limit 85%)".into()), Some("CPU 94% (limit 85%) and memory 95% (limit 90%)".into()), None]
+            [
+                over(&watch(), level(94.0, 50.0, 2.0)),
+                over(&watch(), level(94.0, 95.0, 2.0)),
+                over(&watch(), level(40.0, 50.0, 2.0)),
+                over(&watch(), level(80.0, 50.0, 15.8)),
+            ],
+            [
+                Some("CPU 94% (limit 85%)".into()),
+                Some("CPU 94% (limit 85%) and memory 95% (limit 90%)".into()),
+                None,
+                Some("load 15.8 (limit 12)".into()),
+            ]
         );
+    }
+
+    #[test]
+    fn a_long_run_queue_trips_it_even_while_cpu_stays_under_its_limit() {
+        let mut breaker = Breaker::default();
+        let changes: Vec<Option<Change>> =
+            (0..13).map(|index| breaker.observe(&watch(), &loaded(84.0, 60.0, 15.0), at(index * 10))).collect();
+
+        assert_eq!(changes[12], Some(Change::Tripped("load 15.0 (limit 12)".into())));
     }
 
     fn feed(breaker: &mut Breaker, cpus: &[f32], start: u64) -> Vec<Option<Change>> {
@@ -331,7 +364,7 @@ mod tests {
         prompts: RefCell<Vec<(String, String)>>,
     }
 
-    impl Herdr for FakeHerdr {
+    impl Host for FakeHerdr {
         fn agents(&self) -> Result<Vec<Agent>, String> {
             Ok(self.agents.clone())
         }
@@ -365,7 +398,7 @@ mod tests {
             refuse: RefCell::new(vec!["w3:p1".into()]),
             prompts: RefCell::new(vec![]),
         };
-        let config = Config { jobs: vec![], watches: vec![watch()] };
+        let config = Config { watches: vec![watch()], ..Config::default() };
         let mut watcher = Watcher::default();
 
         let quiet = watcher.tick(at(0), &config, &sample(95.0, 50.0), &herdr);
@@ -384,11 +417,11 @@ mod tests {
         assert_eq!(prompts.last().map(|(pane, _)| pane.as_str()), Some("w3:p1"));
         assert_eq!(
             prompts[0].1,
-            "[nudge: overload] STHMAC is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so Shane can keep using the computer, and say in a few lines what it was. Shane is gaming."
+            "[nudge: overload] the-mac is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so whoever is using the computer can keep working, and say in a few lines what it was. Someone is gaming."
         );
         assert_eq!(
             prompts[1].1,
-            "[nudge: overload] STHMAC is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Pause heavy work you started (builds, encodes, test runs, containers) and start nothing heavy until nudge says overload has cleared. the agent in /code/homelab is finding out why."
+            "[nudge: overload] the-mac is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Pause heavy work you started (builds, encodes, test runs, containers) and start nothing heavy until nudge says overload has cleared. the agent in /code/homelab is finding out why."
         );
     }
 
@@ -399,7 +432,7 @@ mod tests {
             refuse: RefCell::new(vec!["w2:p1".into()]),
             prompts: RefCell::new(vec![]),
         };
-        let config = Config { jobs: vec![], watches: vec![watch()] };
+        let config = Config { watches: vec![watch()], ..Config::default() };
         let mut watcher = Watcher::default();
         watcher.tick(at(0), &config, &sample(95.0, 95.0), &herdr);
 
@@ -424,7 +457,7 @@ mod tests {
         );
         assert_eq!(
             clear_text(&watch(), &sample(10.0, 10.0)),
-            "[nudge: overload] cleared: STHMAC has averaged under its limits for 5m (CPU 10%, memory 10% now). Heavy work can resume."
+            "[nudge: overload] cleared: the-mac has averaged under its limits for 5m (CPU 10%, memory 10%, load 2.0 now). Heavy work can resume."
         );
     }
 }

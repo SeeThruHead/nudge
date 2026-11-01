@@ -54,6 +54,7 @@ impl Sampler {
             host: System::host_name().unwrap_or_else(|| "this machine".into()),
             cpu: self.system.global_cpu_usage(),
             memory: memory_used(&self.system),
+            load: System::load_average().one as f32,
             busiest,
         }
     }
@@ -71,6 +72,7 @@ mod tests {
 
         assert!((0.0..=100.0).contains(&sample.cpu));
         assert!((0.0..=100.0).contains(&sample.memory) && sample.memory > 0.0);
+        assert!(sample.load >= 0.0);
         assert!(!sample.busiest.is_empty() && sample.busiest.len() <= 8);
         assert!(sample.busiest.windows(2).all(|pair| pair[0].cpu >= pair[1].cpu));
     }
