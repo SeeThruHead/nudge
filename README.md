@@ -1,7 +1,7 @@
 # nudge
 
 A scheduler for coding agents. nudge sends a prompt to an agent on a schedule (every 30 minutes, at 09:00,
-or any cron pattern), and when the machine stays overloaded it tells every agent to pause heavy work and has
+or any cron pattern), and when the machine stays overloaded it tells every busy agent to pause heavy work and has
 one of them find out why.
 
 It reaches agents where they already run:
@@ -66,7 +66,7 @@ load = 12                                      # 1-minute load average; about 1.
 for = "1m"                                     # how long the average must stay over (default 2m)
 clear_for = "5m"                               # how long under before it clears (default 5m)
 investigator = { cwd = "/Users/me/code/ops" }  # who finds out why; any target works
-broadcast = true                               # tell every agent too (default true)
+broadcast = true                               # tell every busy agent too (default true)
 message = "Extra instructions for the investigator."
 ```
 
@@ -74,9 +74,10 @@ Each message starts with `[nudge: <job>, <schedule>]` so the agent knows where i
 job waits while its previous run is still going, and appends Claude's output to
 `~/.local/state/nudge/<job>.log`.
 
-A watch averages the machine's CPU, memory and load over `for` and trips when any limit is over: every agent
-is told what is using the machine and to pause heavy work, and the investigator is told to find out why and
-fix it. Load matters most for "I can't click anything": a burst of test runs can queue far more work than
+A watch averages the machine's CPU, memory and load over `for` and trips when any limit is over: every busy
+agent is told what is using the machine and to pause heavy work, and the investigator is told to find out why
+and fix it. Idle agents are left alone, since they are not running anything, and only the agents that were
+told to pause hear that it has cleared. Load matters most for "I can't click anything": a burst of test runs can queue far more work than
 there are cores while CPU averages just under 85%. Memory is macOS's own figure (`kern.memorystatus_level`)
 on a Mac and the share of RAM not available on Linux.
 

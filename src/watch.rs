@@ -1,5 +1,5 @@
 use crate::config::{Config, Watch};
-use crate::host::Host;
+use crate::host::{Agent, Host};
 use crate::schedule::{Pick, pick};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -129,7 +129,7 @@ pub fn broadcast_text(watch: &Watch, sample: &Sample, reason: &str) -> String {
 pub fn investigator_text(watch: &Watch, sample: &Sample, reason: &str) -> String {
     let extra = if watch.message.is_empty() { String::new() } else { format!(" {}", watch.message) };
     format!(
-        "{} Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so whoever is using the computer can keep working, and say in a few lines what it was.{extra}",
+        "{} Every busy agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so whoever is using the computer can keep working, and say in a few lines what it was.{extra}",
         lead(watch, sample, reason)
     )
 }
@@ -159,6 +159,11 @@ const GIVE_UP: Duration = Duration::from_secs(15 * 60);
 pub struct Watcher {
     breakers: HashMap<String, Breaker>,
     outbox: Vec<Pending>,
+    told: HashMap<String, Vec<String>>,
+}
+
+fn is_busy(agent: &Agent) -> bool {
+    agent.agent_status != "idle" && agent.agent_status != "done"
 }
 
 impl Watcher {
@@ -204,12 +209,21 @@ impl Watcher {
                 (clear_text(watch, sample), investigator_pane.clone().map(|pane| (pane, clear_text(watch, sample))))
             }
         };
+        let told = self.told.remove(&watch.name).unwrap_or_default();
+        let listening = |agent: &&Agent| match &change {
+            Change::Tripped(_) => is_busy(agent),
+            Change::Cleared => told.contains(&agent.pane_id),
+        };
         let others: Vec<Pending> = agents
             .iter()
             .filter(|_| watch.broadcast)
             .filter(|agent| Some(&agent.pane_id) != investigator_pane.as_ref())
+            .filter(listening)
             .map(|agent| Pending { pane: agent.pane_id.clone(), text: everyone.clone(), since: now })
             .collect();
+        if let Change::Tripped(_) = &change {
+            self.told.insert(watch.name.clone(), others.iter().map(|pending| pending.pane.clone()).collect());
+        }
         let lead_count = usize::from(lead.is_some());
         let missing = match (&investigator, &investigator_pane) {
             (Some((target, Pick::Missing)), None) => {
@@ -388,12 +402,13 @@ mod tests {
     }
 
     #[test]
-    fn tells_every_agent_to_pause_the_investigator_to_find_out_why_and_retries_one_that_is_blocked() {
+    fn tells_every_busy_agent_to_pause_the_investigator_to_find_out_why_and_retries_one_that_is_blocked() {
         let herdr = FakeHerdr {
             agents: vec![
                 agent("w1:p1", "working", "/code/homelab"),
                 agent("w2:p1", "working", "/code/encode"),
                 agent("w3:p1", "blocked", "/code/site"),
+                agent("w4:p1", "idle", "/code/blog"),
             ],
             refuse: RefCell::new(vec!["w3:p1".into()]),
             prompts: RefCell::new(vec![]),
@@ -415,9 +430,10 @@ mod tests {
         );
         assert_eq!(sent, vec!["w1:p1".to_string(), "w2:p1".to_string()]);
         assert_eq!(prompts.last().map(|(pane, _)| pane.as_str()), Some("w3:p1"));
+        assert!(prompts.iter().all(|(pane, _)| pane != "w4:p1"));
         assert_eq!(
             prompts[0].1,
-            "[nudge: overload] the-mac is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Every agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so whoever is using the computer can keep working, and say in a few lines what it was. Someone is gaming."
+            "[nudge: overload] the-mac is overloaded: CPU 95% (limit 85%) on average over the last 2m. Busiest now: ffmpeg (pid 41) 780% CPU, 900 MB; dagger (pid 7) 120% CPU, 2100 MB. Every busy agent on this machine was told to pause heavy work. Find out what is using the machine and why, then stop or fix it so whoever is using the computer can keep working, and say in a few lines what it was. Someone is gaming."
         );
         assert_eq!(
             prompts[1].1,
@@ -459,5 +475,29 @@ mod tests {
             clear_text(&watch(), &sample(10.0, 10.0)),
             "[nudge: overload] cleared: the-mac has averaged under its limits for 5m (CPU 10%, memory 10%, load 2.0 now). Heavy work can resume."
         );
+    }
+
+    #[test]
+    fn only_the_agents_told_to_pause_hear_that_it_has_cleared() {
+        let herdr = FakeHerdr {
+            agents: vec![
+                agent("w1:p1", "working", "/code/homelab"),
+                agent("w2:p1", "working", "/code/encode"),
+                agent("w3:p1", "idle", "/code/site"),
+            ],
+            refuse: RefCell::new(vec![]),
+            prompts: RefCell::new(vec![]),
+        };
+        let config = Config { watches: vec![watch()], ..Config::default() };
+        let mut watcher = Watcher::default();
+        watcher.tick(at(0), &config, &sample(95.0, 50.0), &herdr);
+        watcher.tick(at(120), &config, &sample(95.0, 50.0), &herdr);
+        herdr.prompts.borrow_mut().clear();
+
+        let cleared = watcher.tick(at(120 + 300), &config, &sample(10.0, 10.0), &herdr);
+        let told: Vec<String> = herdr.prompts.borrow().iter().map(|(pane, _)| pane.clone()).collect();
+
+        assert_eq!(cleared, vec!["overload: cleared, telling 2 agents, w1:p1 investigates".to_string()]);
+        assert_eq!(told, vec!["w1:p1".to_string(), "w2:p1".to_string()]);
     }
 }
