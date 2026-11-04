@@ -9,6 +9,8 @@ pub struct Process {
     pub pid: u32,
     pub parent: Option<u32>,
     pub name: String,
+    pub command: Vec<String>,
+    pub started: u64,
 }
 
 pub trait Processes {
@@ -63,11 +65,10 @@ pub struct Enforcer {
 }
 
 impl Enforcer {
-    pub fn tick(&mut self, processes: &mut dyn Processes) -> Vec<String> {
-        let listed = processes.list();
+    pub fn tick(&mut self, listed: &[Process], processes: &dyn Processes) -> Vec<String> {
         let alive: HashSet<u32> = listed.iter().map(|process| process.pid).collect();
         self.refused.retain(|pid| alive.contains(pid));
-        let tree = tree(&listed);
+        let tree = tree(listed);
         let (moved, refused): (Vec<Attempt>, Vec<Attempt>) = escaped(&tree, processes)
             .into_iter()
             .filter(|process| !self.refused.contains(&process.pid))
@@ -152,7 +153,7 @@ impl Processes for Machine {
         self.system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
-            sysinfo::ProcessRefreshKind::nothing(),
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
         );
         self.system
             .processes()
@@ -161,6 +162,8 @@ impl Processes for Machine {
                 pid: pid.as_u32(),
                 parent: process.parent().map(|parent| parent.as_u32()),
                 name: process.name().to_string_lossy().into_owned(),
+                command: process.cmd().iter().map(|part| part.to_string_lossy().into_owned()).collect(),
+                started: process.start_time(),
             })
             .collect()
     }
@@ -192,7 +195,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn process(pid: u32, parent: u32, name: &str) -> Process {
-        Process { pid, parent: Some(parent), name: name.into() }
+        Process { pid, parent: Some(parent), name: name.into(), command: vec![name.into()], started: 1 }
     }
 
     struct Fake {
@@ -254,8 +257,9 @@ mod tests {
         let mut fake = machine();
         let mut enforcer = Enforcer::default();
 
-        let first = enforcer.tick(&mut fake);
-        let second = enforcer.tick(&mut fake);
+        let listed = fake.list();
+        let first = enforcer.tick(&listed, &fake);
+        let second = enforcer.tick(&listed, &fake);
 
         assert_eq!(
             first,
@@ -272,8 +276,9 @@ mod tests {
         let mut fake = Fake { refuse: vec![14], ..machine() };
         let mut enforcer = Enforcer::default();
 
-        let first = enforcer.tick(&mut fake);
-        let second = enforcer.tick(&mut fake);
+        let listed = fake.list();
+        let first = enforcer.tick(&listed, &fake);
+        let second = enforcer.tick(&listed, &fake);
 
         assert_eq!(first[1], "background: could not put node (14) in the background: Operation not permitted");
         assert!(second.is_empty());

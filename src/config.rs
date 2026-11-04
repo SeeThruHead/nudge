@@ -79,12 +79,40 @@ pub struct Park {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Freeze {
+    pub enabled: bool,
+    pub active_within: Duration,
+    pub load: f32,
+    pub memory_free: f32,
+    pub thaw_after: Duration,
+    pub heavy: Vec<String>,
+}
+
+pub fn cores() -> f32 {
+    std::thread::available_parallelism().map(|count| count.get() as f32).unwrap_or(8.0)
+}
+
+impl Default for Freeze {
+    fn default() -> Freeze {
+        Freeze {
+            enabled: true,
+            active_within: Duration::from_secs(120),
+            load: cores(),
+            memory_free: 20.0,
+            thaw_after: Duration::from_secs(60),
+            heavy: crate::freeze::DEFAULT_HEAVY.iter().map(|pattern| pattern.to_string()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub host: String,
     pub jobs: Vec<Job>,
     pub watches: Vec<Watch>,
     pub park: Option<Park>,
     pub background: bool,
+    pub freeze: Freeze,
 }
 
 impl Config {
@@ -101,7 +129,14 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { host: "auto".into(), jobs: vec![], watches: vec![], park: None, background: true }
+        Config {
+            host: "auto".into(),
+            jobs: vec![],
+            watches: vec![],
+            park: None,
+            background: true,
+            freeze: Freeze::default(),
+        }
     }
 }
 
@@ -172,6 +207,20 @@ fn thirty_minutes() -> String {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawFreeze {
+    #[serde(default = "yes")]
+    enabled: bool,
+    active_within: Option<String>,
+    load: Option<f32>,
+    memory_free: Option<f32>,
+    thaw_after: Option<String>,
+    heavy: Option<Vec<String>>,
+    #[serde(default)]
+    also: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawBackground {
     #[serde(default = "yes")]
     enabled: bool,
@@ -188,6 +237,7 @@ struct RawConfig {
     watch: Vec<RawWatch>,
     park: Option<RawPark>,
     background: Option<RawBackground>,
+    freeze: Option<RawFreeze>,
 }
 
 fn auto() -> String {
@@ -272,24 +322,23 @@ fn duration(name: &str, key: &str, text: &str) -> Result<Duration, String> {
 
 fn percent(name: &str, key: &str, value: Option<f32>) -> Result<Option<f32>, String> {
     match value {
-        Some(limit) if !(1.0..=100.0).contains(&limit) => {
-            Err(format!("watch {name}: {key} must be a percent from 1 to 100"))
-        }
+        Some(limit) if !(1.0..=100.0).contains(&limit) => Err(format!("{name}: {key} must be a percent from 1 to 100")),
         other => Ok(other),
     }
 }
 
 fn positive(name: &str, key: &str, value: Option<f32>) -> Result<Option<f32>, String> {
     match value {
-        Some(limit) if limit <= 0.0 => Err(format!("watch {name}: {key} must be above 0")),
+        Some(limit) if limit <= 0.0 => Err(format!("{name}: {key} must be above 0")),
         other => Ok(other),
     }
 }
 
 fn watch(raw: RawWatch) -> Result<Watch, String> {
-    let cpu = percent(&raw.name, "cpu", raw.cpu)?;
-    let memory = percent(&raw.name, "memory", raw.memory)?;
-    let load = positive(&raw.name, "load", raw.load)?;
+    let owner = format!("watch {}", raw.name);
+    let cpu = percent(&owner, "cpu", raw.cpu)?;
+    let memory = percent(&owner, "memory", raw.memory)?;
+    let load = positive(&owner, "load", raw.load)?;
     if cpu.is_none() && memory.is_none() && load.is_none() {
         return Err(format!("watch {}: give a cpu, memory or load limit", raw.name));
     }
@@ -318,6 +367,32 @@ fn park(raw: RawPark) -> Result<Park, String> {
     Ok(Park { after, skip: raw.skip })
 }
 
+fn freeze_duration(key: &str, text: Option<String>, default: Duration) -> Result<Duration, String> {
+    text.map(|text| {
+        humantime::parse_duration(&text).map_err(|e| format!("freeze: {key} = {text:?} is not a duration ({e})"))
+    })
+    .unwrap_or(Ok(default))
+}
+
+fn freeze(raw: Option<RawFreeze>) -> Result<Freeze, String> {
+    let defaults = Freeze::default();
+    let Some(raw) = raw else { return Ok(defaults) };
+    let load = positive("freeze", "load", raw.load)?.unwrap_or(defaults.load);
+    let memory_free = percent("freeze", "memory_free", raw.memory_free)?.unwrap_or(defaults.memory_free);
+    let heavy: Vec<String> = raw.heavy.unwrap_or(defaults.heavy).into_iter().chain(raw.also).collect();
+    if raw.enabled && heavy.iter().all(|pattern| pattern.trim().is_empty()) {
+        return Err("freeze: heavy names nothing to freeze".into());
+    }
+    Ok(Freeze {
+        enabled: raw.enabled,
+        active_within: freeze_duration("active_within", raw.active_within, defaults.active_within)?,
+        load,
+        memory_free,
+        thaw_after: freeze_duration("thaw_after", raw.thaw_after, defaults.thaw_after)?,
+        heavy,
+    })
+}
+
 fn unique<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), String> {
     let mut names: Vec<&str> = names.collect();
     names.sort_unstable();
@@ -337,7 +412,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
     unique(jobs.iter().map(|j| j.name.as_str()).chain(watches.iter().map(|w| w.name.as_str())))?;
     let park = raw.park.map(park).transpose()?;
     let background = raw.background.is_none_or(|background| background.enabled);
-    Ok(Config { host: raw.host, jobs, watches, park, background })
+    let freeze = freeze(raw.freeze)?;
+    Ok(Config { host: raw.host, jobs, watches, park, background, freeze })
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -564,6 +640,26 @@ investigator = { cwd = "/code/homelab" }
         assert!(parse("[background]\n").unwrap().background);
         assert!(!parse("[background]\nenabled = false\n").unwrap().background);
         assert!(parse("[background]\non = false\n").is_err());
+    }
+
+    #[test]
+    fn freezes_heavy_work_by_default_with_this_machines_core_count_and_takes_overrides() {
+        let text = "[freeze]\nload = 6\nmemory_free = 15\nactive_within = \"90s\"\nalso = [\"ffmpeg\"]\n";
+        let tuned = parse(text).unwrap().freeze;
+
+        assert_eq!(parse("").unwrap().freeze, Freeze::default());
+        assert_eq!(Freeze::default().load, cores());
+        assert_eq!((tuned.load, tuned.memory_free, tuned.active_within), (6.0, 15.0, Duration::from_secs(90)));
+        assert_eq!(tuned.heavy.last().map(String::as_str), Some("ffmpeg"));
+        assert!(tuned.heavy.contains(&"vitest".to_string()));
+        assert_eq!(parse("[freeze]\nheavy = [\"burner\"]\n").unwrap().freeze.heavy, ["burner"]);
+        assert!(!parse("[freeze]\nenabled = false\n").unwrap().freeze.enabled);
+        assert_eq!(parse("[freeze]\nheavy = []\n").unwrap_err(), "freeze: heavy names nothing to freeze");
+        assert_eq!(
+            parse("[freeze]\nmemory_free = 0\n").unwrap_err(),
+            "freeze: memory_free must be a percent from 1 to 100"
+        );
+        assert!(parse("[freeze]\nthaw_after = \"soon\"\n").unwrap_err().starts_with("freeze: thaw_after"));
     }
 
     #[test]

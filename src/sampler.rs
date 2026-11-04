@@ -17,6 +17,12 @@ fn memory_used(system: &System) -> f32 {
     (1.0 - system.available_memory() as f32 / system.total_memory().max(1) as f32) * 100.0
 }
 
+pub fn memory_free() -> f32 {
+    let mut system = System::new();
+    system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
+    100.0 - memory_used(&system)
+}
+
 pub struct Sampler {
     system: System,
 }
