@@ -113,7 +113,10 @@ they start yield the CPU to whoever is using the machine. Some launchers drop th
 (a vitest run under bun came out at normal priority, with its Chrome). `nudge run` checks every process under
 each Herdr server every 5 seconds and puts any that is not in the background back in it
 (`setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)`, what `taskpolicy -b -p` does), logging what it moved.
-`nudge check` shows how many processes are under Herdr and which are not in the background now. A Herdr
+`nudge check` shows how many processes are under Herdr and which are above background base priority now.
+It checks each task's base priority: `ps` shows a process's busiest thread, and a thread in a background
+process can run higher for a moment while the kernel boosts it to serve a higher-priority waiter, which is
+not an escape. A Herdr
 server is a `herdr` process whose parent is launchd; the server itself and anything outside it are left alone.
 
 ## Commands

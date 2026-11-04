@@ -279,9 +279,15 @@ fn check_background(config: &Config) {
     let tree = background::tree(&background::Processes::list(&mut machine));
     let escaped = background::escaped(&tree, &machine);
     let state = match escaped.as_slice() {
-        [] => "all in the background".to_string(),
+        [] => {
+            "all at background base priority (4); ps can still show a single thread briefly boosted higher".to_string()
+        }
         some => {
-            format!("{} not in the background now (nudge run moves them): {}", some.len(), background::described(some))
+            format!(
+                "{} above background base priority now (nudge run moves them): {}",
+                some.len(),
+                background::described(some)
+            )
         }
     };
     println!("background: on, {} processes under {} herdr servers, {state}", tree.under.len(), tree.servers);

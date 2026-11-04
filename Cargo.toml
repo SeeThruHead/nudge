@@ -1,6 +1,6 @@
 [package]
 name = "nudge"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Schedules prompts to coding agents in Herdr, tmux, cmux, Orca or Claude Code, and tells them to back off when the machine is overloaded"
 license = "MIT"
