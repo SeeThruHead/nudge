@@ -106,6 +106,17 @@ An agent is never parked while it is working or blocked, while its Claude proces
 (a background shell, a dev server, a test run), while text is in its prompt box, or when `skip` or a watch's
 investigator names it. Overload warnings and all-clears skip parked agents, since they are not using the machine.
 
+## Keep agents' work in the background (macOS)
+
+A Herdr pane shell can put itself in the background (`taskpolicy -b -p $$` in `.zshrc`), so agents and what
+they start yield the CPU to whoever is using the machine. Some launchers drop that policy for what they spawn
+(a vitest run under bun came out at normal priority, with its Chrome). `nudge run` checks every process under
+each Herdr server every 5 seconds and puts any that is not in the background back in it
+(`setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)`, what `taskpolicy -b -p` does), logging what it moved.
+`nudge check` shows how many processes are under Herdr and which are not in the background now. A Herdr
+server is a `herdr` process whose parent is launchd; the server itself and anything outside it are left alone.
+
+## Commands
 
 ```text
 nudge run           read the config, send each job when it is due, check each watch
