@@ -75,6 +75,13 @@ skip = [{ cwd = "/Users/me/code/ops" }]        # never park these; investigators
 
 [background]                                   # macOS; on unless enabled = false
 enabled = true
+
+[freeze]                                       # macOS; on unless enabled = false; defaults shown
+active_within = "2m"                           # keyboard or mouse used this recently: someone is at the Mac
+load = 10                                      # 1-minute load average; defaults to this machine's core count
+memory_free = 20                               # percent
+thaw_after = "1m"                              # under both limits this long before thawing
+also = ["ffmpeg"]                              # added to the heavy list; heavy = [...] replaces it
 ```
 
 Each message starts with `[nudge: <job>, <schedule>]` so the agent knows where it came from. A `via = "claude"`
@@ -102,9 +109,11 @@ through your interactive zsh, so a `claude` shell function still adds its flags)
 investigator wakes a parked agent just by prompting it. When Claude exits, the pane is back at its shell.
 Ctrl-C leaves the placeholder and prints the `claude --resume` line.
 
-An agent is never parked while it is working or blocked, while its Claude process still has a child running
-(a background shell, a dev server, a test run), while text is in its prompt box, or when `skip` or a watch's
-investigator names it. Overload warnings and all-clears skip parked agents, since they are not using the machine.
+An agent is never parked while it is working or blocked, while its Claude process still runs a shell (a
+background command, a dev server, a test run, which Claude always starts through a shell), while text is in
+its prompt box, or when `skip` or a watch's
+investigator names it. Other children of Claude, such as the MCP and language servers it starts from
+`.mcp.json` and plugins, do not count; any still running once Claude has exited are closed. Overload warnings and all-clears skip parked agents, since they are not using the machine.
 
 ## Keep agents' work in the background (macOS)
 
@@ -119,6 +128,21 @@ process can run higher for a moment while the kernel boosts it to serve a higher
 not an escape. A Herdr
 server is a `herdr` process whose parent is launchd; the server itself and anything outside it are left alone.
 
+## Freeze heavy work while someone is using the Mac (macOS)
+
+Background priority is not always enough to keep the Mac responsive. While someone is at the Mac (keyboard
+or mouse used within `active_within`, from `HIDIdleTime`) and the 1-minute load is over `load` or free memory
+is under `memory_free`, `nudge run` stops (SIGSTOP) the heavy processes under each Herdr server and everything
+they started: vitest, tsc, tsgo, tsgolint, oxlint, Playwright, Chrome, Chromium and chrome-headless-shell,
+cargo, rustc, clippy-driver, `bun test` and moon. It continues them (SIGCONT) once nobody has used the Mac for
+`active_within`, or load and memory have stayed under the limits for `thaw_after`. Claude, herdr, shells and
+nudge itself are never stopped, nor anything outside Herdr. Frozen work just waits, but a command with a
+wall-clock timeout (a Claude Bash call, `timeout`) can run out while frozen.
+
+Each freeze and thaw is logged and shown in `nudge check`. What is frozen is kept in
+`~/.local/state/nudge/freeze.json`: `nudge run` thaws it when it stops (TERM, INT or HUP) and when it starts,
+so a crash leaves nothing stopped for long, and `nudge thaw` continues everything by hand.
+
 ## Commands
 
 ```text
@@ -128,6 +152,7 @@ nudge check         show the host, where each job goes and when it runs next, ho
                     which agents are parked and when each resting agent parks,
                     and which processes under Herdr are not in the background
 nudge wake <agent>  resume a parked agent (by name or pane) with no message
+nudge thaw          continue every process nudge froze
 nudge --version
 ```
 
