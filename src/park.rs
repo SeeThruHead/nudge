@@ -11,7 +11,7 @@ pub const PLACEHOLDER: &str = "claude";
 
 const EXIT_WAIT: Duration = Duration::from_secs(60);
 const SETTLE: Duration = Duration::from_secs(20);
-const HARMLESS_CHILDREN: [&str; 1] = ["caffeinate"];
+const SHELLS: [&str; 5] = ["zsh", "bash", "sh", "fish", "dash"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parked {
@@ -41,6 +41,13 @@ pub struct State {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    pub pid: u32,
+    pub name: String,
+    pub started: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Foreground {
     pub claude: Option<u32>,
     pub shell: bool,
@@ -51,7 +58,8 @@ pub trait Panes {
     fn screen(&self, pane: &str) -> Result<String, String>;
     fn run(&self, pane: &str, command: &str) -> Result<(), String>;
     fn rename(&self, pane: &str, name: &str) -> Result<(), String>;
-    fn children(&self, pid: u32) -> Vec<String>;
+    fn children(&self, pid: u32) -> Vec<Child>;
+    fn close(&self, children: &[Child]) -> Vec<Child>;
     fn placeholder(&self) -> Result<PathBuf, String>;
 }
 
@@ -122,17 +130,24 @@ fn session(agent: &Agent) -> Option<&str> {
     agent.agent_session.as_ref().map(|session| session.value.as_str()).filter(|id| !id.is_empty())
 }
 
-pub fn ready(agent: &Agent, panes: &dyn Panes) -> Result<(), String> {
+fn is_shell(child: &Child) -> bool {
+    SHELLS.contains(&child.name.trim_start_matches('-'))
+}
+
+fn names(children: &[Child]) -> String {
+    children.iter().map(|child| format!("{} ({})", child.name, child.pid)).collect::<Vec<_>>().join(", ")
+}
+
+pub fn ready(agent: &Agent, panes: &dyn Panes) -> Result<Vec<Child>, String> {
     let foreground = panes.foreground(&agent.pane_id)?;
     let pid = foreground.claude.ok_or_else(|| "no claude process is in the foreground".to_string())?;
-    let running: Vec<String> =
-        panes.children(pid).into_iter().filter(|name| !HARMLESS_CHILDREN.contains(&name.as_str())).collect();
+    let (running, helpers): (Vec<Child>, Vec<Child>) = panes.children(pid).into_iter().partition(is_shell);
     if !running.is_empty() {
-        return Err(format!("it still runs {}", running.join(", ")));
+        return Err(format!("it still runs a shell: {}", names(&running)));
     }
     match draft(&panes.screen(&agent.pane_id)?) {
         Some(_) => Err("a draft is in its prompt box".into()),
-        None => Ok(()),
+        None => Ok(helpers),
     }
 }
 
@@ -140,6 +155,7 @@ pub fn ready(agent: &Agent, panes: &dyn Panes) -> Result<(), String> {
 struct Exiting {
     parked: Parked,
     since: SystemTime,
+    helpers: Vec<Child>,
 }
 
 #[derive(Default)]
@@ -218,7 +234,15 @@ impl Parker {
         let (log, keep): (Vec<Option<String>>, Vec<Option<Exiting>>) = std::mem::take(&mut self.exiting)
             .into_iter()
             .map(|exiting| match panes.foreground(&exiting.parked.pane) {
-                Ok(Foreground { shell: true, .. }) => (Some(self.place(now, exiting.parked, panes)), None),
+                Ok(Foreground { shell: true, .. }) => {
+                    let closed = panes.close(&exiting.helpers);
+                    let placed = self.place(now, exiting.parked, panes);
+                    let line = match closed.is_empty() {
+                        true => placed,
+                        false => format!("{placed}; closed what claude left running: {}", names(&closed)),
+                    };
+                    (Some(line), None)
+                }
                 _ if now.duration_since(exiting.since).is_ok_and(|waited| waited >= EXIT_WAIT) => (
                     Some(format!(
                         "park: {} ({}) did not leave claude within a minute, leaving it alone",
@@ -303,12 +327,12 @@ impl Parker {
             since: seconds(now),
             named_in_herdr: agent.name.is_some(),
         };
-        let outcome = ready(agent, panes).and_then(|()| host.prompt(&resting.pane, "/exit"));
+        let outcome = ready(agent, panes).and_then(|helpers| host.prompt(&resting.pane, "/exit").map(|()| helpers));
         match outcome {
-            Ok(()) => {
+            Ok(helpers) => {
                 self.said.remove(&resting.pane);
                 self.state.resting.retain(|other| other.pane != resting.pane);
-                self.exiting.push(Exiting { parked, since: now });
+                self.exiting.push(Exiting { parked, since: now, helpers });
                 Some(format!(
                     "park: {} ({}) rested {}, closing claude",
                     resting.name,
@@ -431,6 +455,23 @@ pub fn install(from: &Path, dir: &Path) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+fn everything() -> Vec<(Option<u32>, Child)> {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, sysinfo::ProcessRefreshKind::nothing());
+    system
+        .processes()
+        .iter()
+        .map(|(pid, process)| {
+            let child = Child {
+                pid: pid.as_u32(),
+                name: process.name().to_string_lossy().into_owned(),
+                started: process.start_time(),
+            };
+            (process.parent().map(|parent| parent.as_u32()), child)
+        })
+        .collect()
+}
+
 impl Panes for HerdrPanes {
     fn foreground(&self, pane: &str) -> Result<Foreground, String> {
         parse_foreground(&self.herdr.run(&["pane", "process-info", "--pane", pane], None)?)
@@ -444,18 +485,16 @@ impl Panes for HerdrPanes {
     fn rename(&self, pane: &str, name: &str) -> Result<(), String> {
         self.herdr.run(&["agent", "rename", pane, name], None).map(|_| ())
     }
-    fn children(&self, pid: u32) -> Vec<String> {
-        let mut system = sysinfo::System::new();
-        system.refresh_processes_specifics(
-            sysinfo::ProcessesToUpdate::All,
-            true,
-            sysinfo::ProcessRefreshKind::nothing(),
-        );
-        system
-            .processes()
-            .values()
-            .filter(|process| process.parent().is_some_and(|parent| parent.as_u32() == pid))
-            .map(|process| process.name().to_string_lossy().into_owned())
+    fn children(&self, pid: u32) -> Vec<Child> {
+        everything().into_iter().filter(|(parent, _)| *parent == Some(pid)).map(|(_, child)| child).collect()
+    }
+    fn close(&self, children: &[Child]) -> Vec<Child> {
+        let alive: Vec<Child> = everything().into_iter().map(|(_, child)| child).collect();
+        children
+            .iter()
+            .filter(|child| alive.contains(child))
+            .filter(|child| crate::freeze::terminate(child.pid).is_ok())
+            .cloned()
             .collect()
     }
     fn placeholder(&self) -> Result<PathBuf, String> {
@@ -487,7 +526,8 @@ mod tests {
         runs: RefCell<Vec<(String, String)>>,
         renames: RefCell<Vec<(String, String)>>,
         shell: RefCell<Vec<String>>,
-        children: Vec<String>,
+        children: Vec<Child>,
+        closed: RefCell<Vec<Child>>,
         screen: String,
     }
 
@@ -499,6 +539,7 @@ mod tests {
             renames: RefCell::new(vec![]),
             shell: RefCell::new(vec![]),
             children: vec![],
+            closed: RefCell::new(vec![]),
             screen: "──── app ─\n❯ \u{1b}[2mTry \"fix the tests\"\u{1b}[0m\n────\n".into(),
         }
     }
@@ -529,12 +570,40 @@ mod tests {
             self.renames.borrow_mut().push((pane.into(), name.into()));
             Ok(())
         }
-        fn children(&self, _: u32) -> Vec<String> {
+        fn children(&self, _: u32) -> Vec<Child> {
             self.children.clone()
+        }
+        fn close(&self, children: &[Child]) -> Vec<Child> {
+            self.closed.borrow_mut().extend(children.iter().cloned());
+            children.to_vec()
         }
         fn placeholder(&self) -> Result<PathBuf, String> {
             Ok(PathBuf::from("/data/nudge/parked/claude"))
         }
+    }
+
+    fn child(pid: u32, name: &str) -> Child {
+        Child { pid, name: name.into(), started: 5 }
+    }
+
+    #[test]
+    fn an_mcp_server_claude_started_does_not_keep_it_from_parking_and_is_closed_once_claude_exits() {
+        let mcp = vec![child(80, "bun"), child(81, "caffeinate")];
+        let herdr = Fake { children: mcp.clone(), ..fake(vec![agent("w9:p1", "idle", "/code/app", "abc")]) };
+        let mut parker = Parker::default();
+        parker.tick(at(0), &park(), &[], &herdr, &herdr);
+        let closing = parker.tick(at(30), &park(), &[], &herdr, &herdr);
+        let early = herdr.closed.borrow().len();
+        herdr.shell.borrow_mut().push("w9:p1".into());
+        let parked = parker.tick(at(31), &park(), &[], &herdr, &herdr);
+
+        assert_eq!(closing, ["park: app (w9:p1) rested 30m, closing claude"]);
+        assert_eq!(early, 0);
+        assert_eq!(
+            parked,
+            ["park: parked app (w9:p1), session abc; closed what claude left running: bun (80), caffeinate (81)"]
+        );
+        assert_eq!(*herdr.closed.borrow(), mcp);
     }
 
     fn at(minutes: u64) -> SystemTime {
@@ -597,8 +666,10 @@ mod tests {
     fn never_parks_a_busy_agent_an_agent_that_runs_something_or_holds_a_draft_or_one_it_was_told_to_skip() {
         let resting = |pane: &str, cwd: &str| agent(pane, "idle", cwd, pane);
         let busy = fake(vec![resting("w1:p1", "/code/a"), agent("w2:p1", "blocked", "/code/b", "b")]);
-        let running =
-            Fake { children: vec!["caffeinate".into(), "zsh".into()], ..fake(vec![resting("w3:p1", "/code/c")]) };
+        let running = Fake {
+            children: vec![child(70, "caffeinate"), child(71, "zsh")],
+            ..fake(vec![resting("w3:p1", "/code/c")])
+        };
         let drafting = Fake {
             screen: "──── c ─\n❯ fix the \u{1b}[7m \u{1b}[0m\n────\n".into(),
             ..fake(vec![resting("w4:p1", "/code/d")])
@@ -621,7 +692,7 @@ mod tests {
 
         assert!(busy_log.iter().all(Vec::is_empty));
         assert!(busy.prompts.borrow().is_empty());
-        assert_eq!(running_log[1], ["park: not parking c (w3:p1): it still runs zsh"]);
+        assert_eq!(running_log[1], ["park: not parking c (w3:p1): it still runs a shell: zsh (71)"]);
         assert!(running_log[2].is_empty());
         assert_eq!(parkers[1].state.resting[0].since, seconds(at(30)));
         assert!(drafting_log.is_empty());
