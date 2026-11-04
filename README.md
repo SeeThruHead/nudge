@@ -72,6 +72,9 @@ message = "Extra instructions for the investigator."
 [park]                                         # Herdr only; leave the table out to never park
 after = "30m"                                  # idle or done this long (default 30m)
 skip = [{ cwd = "/Users/me/code/ops" }]        # never park these; investigators are never parked either
+
+[background]                                   # macOS; on unless enabled = false
+enabled = true
 ```
 
 Each message starts with `[nudge: <job>, <schedule>]` so the agent knows where it came from. A `via = "claude"`
@@ -108,7 +111,8 @@ investigator names it. Overload warnings and all-clears skip parked agents, sinc
 nudge run           read the config, send each job when it is due, check each watch
 nudge send <job>    send one job's message now
 nudge check         show the host, where each job goes and when it runs next, how each watch stands,
-                    which agents are parked and when each resting agent parks
+                    which agents are parked and when each resting agent parks,
+                    and which processes under Herdr are not in the background
 nudge wake <agent>  resume a parked agent (by name or pane) with no message
 nudge --version
 ```

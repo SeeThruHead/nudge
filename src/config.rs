@@ -84,6 +84,7 @@ pub struct Config {
     pub jobs: Vec<Job>,
     pub watches: Vec<Watch>,
     pub park: Option<Park>,
+    pub background: bool,
 }
 
 impl Config {
@@ -100,7 +101,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { host: "auto".into(), jobs: vec![], watches: vec![], park: None }
+        Config { host: "auto".into(), jobs: vec![], watches: vec![], park: None, background: true }
     }
 }
 
@@ -171,6 +172,13 @@ fn thirty_minutes() -> String {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawBackground {
+    #[serde(default = "yes")]
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default = "auto")]
     host: String,
@@ -179,6 +187,7 @@ struct RawConfig {
     #[serde(default)]
     watch: Vec<RawWatch>,
     park: Option<RawPark>,
+    background: Option<RawBackground>,
 }
 
 fn auto() -> String {
@@ -327,7 +336,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let watches = raw.watch.into_iter().map(watch).collect::<Result<Vec<_>, _>>()?;
     unique(jobs.iter().map(|j| j.name.as_str()).chain(watches.iter().map(|w| w.name.as_str())))?;
     let park = raw.park.map(park).transpose()?;
-    Ok(Config { host: raw.host, jobs, watches, park })
+    let background = raw.background.is_none_or(|background| background.enabled);
+    Ok(Config { host: raw.host, jobs, watches, park, background })
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -546,6 +556,14 @@ investigator = { cwd = "/code/homelab" }
             parse("[park]\nafter = \"later\"\n").unwrap_err().starts_with("park: after = \"later\" is not a duration")
         );
         assert!(parse("[park]\nwindow = \"30m\"\n").is_err());
+    }
+
+    #[test]
+    fn keeps_herdr_processes_in_the_background_unless_turned_off() {
+        assert!(parse("").unwrap().background);
+        assert!(parse("[background]\n").unwrap().background);
+        assert!(!parse("[background]\nenabled = false\n").unwrap().background);
+        assert!(parse("[background]\non = false\n").is_err());
     }
 
     #[test]
