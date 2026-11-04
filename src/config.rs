@@ -89,7 +89,12 @@ pub struct Config {
 impl Config {
     pub fn never_parked(&self) -> Vec<Target> {
         let skip = self.park.iter().flat_map(|park| park.skip.iter().cloned());
-        skip.chain(self.watches.iter().filter_map(|watch| watch.investigator.clone())).collect()
+        let all: Vec<Target> = skip.chain(self.watches.iter().filter_map(|watch| watch.investigator.clone())).collect();
+        all.iter()
+            .enumerate()
+            .filter(|(index, target)| !all[..*index].contains(target))
+            .map(|(_, t)| t.clone())
+            .collect()
     }
 }
 
@@ -523,7 +528,7 @@ message = "Someone is gaming tonight."
         let text = r#"
 [park]
 after = "45m"
-skip = [{ agent = "deploys" }]
+skip = [{ agent = "deploys" }, { cwd = "/code/homelab" }]
 
 [[watch]]
 name = "overload"
