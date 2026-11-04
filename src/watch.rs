@@ -167,14 +167,21 @@ fn is_busy(agent: &Agent) -> bool {
 }
 
 impl Watcher {
-    pub fn tick(&mut self, now: SystemTime, config: &Config, sample: &Sample, herdr: &dyn Host) -> Vec<String> {
+    pub fn tick(
+        &mut self,
+        now: SystemTime,
+        config: &Config,
+        sample: &Sample,
+        herdr: &dyn Host,
+        parked: &[String],
+    ) -> Vec<String> {
         self.breakers.retain(|name, _| config.watches.iter().any(|watch| &watch.name == name));
         let changes: Vec<String> = config
             .watches
             .iter()
             .filter_map(|watch| {
                 let change = self.breakers.entry(watch.name.clone()).or_default().observe(watch, sample, now)?;
-                Some(self.queue(watch, sample, change, now, herdr))
+                Some(self.queue(watch, sample, change, now, herdr, parked))
             })
             .flatten()
             .collect();
@@ -188,6 +195,7 @@ impl Watcher {
         change: Change,
         now: SystemTime,
         herdr: &dyn Host,
+        parked: &[String],
     ) -> Vec<String> {
         let agents = match herdr.agents() {
             Ok(agents) => agents,
@@ -218,6 +226,7 @@ impl Watcher {
             .iter()
             .filter(|_| watch.broadcast)
             .filter(|agent| Some(&agent.pane_id) != investigator_pane.as_ref())
+            .filter(|agent| !parked.contains(&agent.pane_id))
             .filter(listening)
             .map(|agent| Pending { pane: agent.pane_id.clone(), text: everyone.clone(), since: now })
             .collect();
@@ -398,6 +407,7 @@ mod tests {
             name: None,
             cwd: Some(cwd.into()),
             agent_session: None,
+            terminal_title: None,
         }
     }
 
@@ -416,11 +426,11 @@ mod tests {
         let config = Config { watches: vec![watch()], ..Config::default() };
         let mut watcher = Watcher::default();
 
-        let quiet = watcher.tick(at(0), &config, &sample(95.0, 50.0), &herdr);
-        let tripped = watcher.tick(at(120), &config, &sample(95.0, 50.0), &herdr);
+        let quiet = watcher.tick(at(0), &config, &sample(95.0, 50.0), &herdr, &[]);
+        let tripped = watcher.tick(at(120), &config, &sample(95.0, 50.0), &herdr, &[]);
         let sent: Vec<String> = herdr.prompts.borrow().iter().map(|(pane, _)| pane.clone()).collect();
         herdr.refuse.borrow_mut().clear();
-        watcher.tick(at(130), &config, &sample(95.0, 50.0), &herdr);
+        watcher.tick(at(130), &config, &sample(95.0, 50.0), &herdr, &[]);
         let prompts = herdr.prompts.borrow();
 
         assert_eq!(quiet, Vec::<String>::new());
@@ -450,11 +460,11 @@ mod tests {
         };
         let config = Config { watches: vec![watch()], ..Config::default() };
         let mut watcher = Watcher::default();
-        watcher.tick(at(0), &config, &sample(95.0, 95.0), &herdr);
+        watcher.tick(at(0), &config, &sample(95.0, 95.0), &herdr, &[]);
 
-        let tripped = watcher.tick(at(120), &config, &sample(95.0, 95.0), &herdr);
-        let gave_up = watcher.tick(at(120 + 901), &config, &sample(10.0, 10.0), &herdr);
-        let cleared = watcher.tick(at(120 + 901 + 300), &config, &sample(10.0, 10.0), &herdr);
+        let tripped = watcher.tick(at(120), &config, &sample(95.0, 95.0), &herdr, &[]);
+        let gave_up = watcher.tick(at(120 + 901), &config, &sample(10.0, 10.0), &herdr, &[]);
+        let cleared = watcher.tick(at(120 + 901 + 300), &config, &sample(10.0, 10.0), &herdr, &[]);
 
         assert_eq!(
             tripped,
@@ -490,14 +500,34 @@ mod tests {
         };
         let config = Config { watches: vec![watch()], ..Config::default() };
         let mut watcher = Watcher::default();
-        watcher.tick(at(0), &config, &sample(95.0, 50.0), &herdr);
-        watcher.tick(at(120), &config, &sample(95.0, 50.0), &herdr);
+        watcher.tick(at(0), &config, &sample(95.0, 50.0), &herdr, &[]);
+        watcher.tick(at(120), &config, &sample(95.0, 50.0), &herdr, &[]);
         herdr.prompts.borrow_mut().clear();
 
-        let cleared = watcher.tick(at(120 + 300), &config, &sample(10.0, 10.0), &herdr);
+        let cleared = watcher.tick(at(120 + 300), &config, &sample(10.0, 10.0), &herdr, &[]);
         let told: Vec<String> = herdr.prompts.borrow().iter().map(|(pane, _)| pane.clone()).collect();
 
         assert_eq!(cleared, vec!["overload: cleared, telling 2 agents, w1:p1 investigates".to_string()]);
         assert_eq!(told, vec!["w1:p1".to_string(), "w2:p1".to_string()]);
+    }
+
+    #[test]
+    fn an_agent_parked_since_it_was_told_to_pause_is_not_woken_to_hear_the_all_clear() {
+        let herdr = FakeHerdr {
+            agents: vec![agent("w1:p1", "working", "/code/homelab"), agent("w2:p1", "working", "/code/encode")],
+            refuse: RefCell::new(vec![]),
+            prompts: RefCell::new(vec![]),
+        };
+        let config = Config { watches: vec![watch()], ..Config::default() };
+        let mut watcher = Watcher::default();
+        watcher.tick(at(0), &config, &sample(95.0, 50.0), &herdr, &[]);
+        watcher.tick(at(120), &config, &sample(95.0, 50.0), &herdr, &[]);
+        herdr.prompts.borrow_mut().clear();
+
+        let cleared = watcher.tick(at(120 + 300), &config, &sample(10.0, 10.0), &herdr, &["w2:p1".to_string()]);
+        let told: Vec<String> = herdr.prompts.borrow().iter().map(|(pane, _)| pane.clone()).collect();
+
+        assert_eq!(cleared, vec!["overload: cleared, telling 1 agents, w1:p1 investigates".to_string()]);
+        assert_eq!(told, vec!["w1:p1".to_string()]);
     }
 }

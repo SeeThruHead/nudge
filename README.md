@@ -68,6 +68,10 @@ clear_for = "5m"                               # how long under before it clears
 investigator = { cwd = "/Users/me/code/ops" }  # who finds out why; any target works
 broadcast = true                               # tell every busy agent too (default true)
 message = "Extra instructions for the investigator."
+
+[park]                                         # Herdr only; leave the table out to never park
+after = "30m"                                  # idle or done this long (default 30m)
+skip = [{ cwd = "/Users/me/code/ops" }]        # never park these; investigators are never parked either
 ```
 
 Each message starts with `[nudge: <job>, <schedule>]` so the agent knows where it came from. A `via = "claude"`
@@ -81,12 +85,31 @@ told to pause hear that it has cleared. Load matters most for "I can't click any
 there are cores while CPU averages just under 85%. Memory is macOS's own figure (`kern.memorystatus_level`)
 on a Mac and the share of RAM not available on Linux.
 
-## Commands
+## Park idle Claude agents
+
+An idle Claude Code session still holds a few hundred MB. With `[park]`, an agent in Herdr that has been
+`idle` or `done` for `after` is parked: nudge records its pane, name, folder and session in
+`~/.local/state/nudge/park.json`, sends `/exit`, waits for the shell, and runs a small placeholder in the pane
+(a copy of nudge named `claude` in `~/.local/share/nudge/parked`, a few MB). Herdr keeps listing it as an idle
+claude agent with the same name and session, so targets still match it.
+
+The placeholder shows `✳ <name> (parked)` and a prompt box. Enter resumes the session (`claude --resume <id>`
+through your interactive zsh, so a `claude` shell function still adds its flags); a message typed or sent with
+`herdr agent prompt` resumes it with that message as the first prompt. So a job, another agent or the overload
+investigator wakes a parked agent just by prompting it. When Claude exits, the pane is back at its shell.
+Ctrl-C leaves the placeholder and prints the `claude --resume` line.
+
+An agent is never parked while it is working or blocked, while its Claude process still has a child running
+(a background shell, a dev server, a test run), while text is in its prompt box, or when `skip` or a watch's
+investigator names it. Overload warnings and all-clears skip parked agents, since they are not using the machine.
+
 
 ```text
 nudge run           read the config, send each job when it is due, check each watch
 nudge send <job>    send one job's message now
-nudge check         show the host, where each job goes and when it runs next, and how each watch stands
+nudge check         show the host, where each job goes and when it runs next, how each watch stands,
+                    which agents are parked and when each resting agent parks
+nudge wake <agent>  resume a parked agent (by name or pane) with no message
 nudge --version
 ```
 

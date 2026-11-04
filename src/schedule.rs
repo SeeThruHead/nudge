@@ -12,7 +12,7 @@ pub enum Pick<'a> {
     Ambiguous(usize),
 }
 
-fn is_target(target: &Target, agent: &Agent) -> bool {
+pub fn is_target(target: &Target, agent: &Agent) -> bool {
     match target {
         Target::Session(id) => agent.agent_session.as_ref().is_some_and(|s| &s.value == id),
         Target::Agent(name) => agent.name.as_ref() == Some(name),
@@ -141,6 +141,7 @@ mod tests {
             name: None,
             cwd: Some(cwd.into()),
             agent_session: None,
+            terminal_title: None,
         }
     }
 

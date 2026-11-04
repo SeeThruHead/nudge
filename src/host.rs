@@ -20,6 +20,21 @@ pub struct Agent {
     pub cwd: Option<String>,
     #[serde(default)]
     pub agent_session: Option<Session>,
+    #[serde(default)]
+    pub terminal_title: Option<String>,
+}
+
+impl Agent {
+    pub fn title(&self) -> String {
+        let named = self.name.clone().or_else(|| self.terminal_title.clone().map(|title| untitled(&title)));
+        let folder =
+            || self.cwd.as_deref().and_then(|cwd| cwd.rsplit('/').find(|part| !part.is_empty())).map(str::to_string);
+        named.filter(|name| !name.is_empty()).or_else(folder).unwrap_or_else(|| self.pane_id.clone())
+    }
+}
+
+fn untitled(title: &str) -> String {
+    title.trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string()
 }
 
 pub trait Host {
@@ -150,6 +165,7 @@ pub fn parse_tmux(listing: &str, commands: &[String]) -> Vec<Agent> {
                     name: Some(place.to_string()),
                     cwd: Some(cwd.to_string()),
                     agent_session: None,
+                    terminal_title: None,
                 }),
                 _ => None,
             }
@@ -209,6 +225,7 @@ pub fn cmux_agent(id: &str, title: &str, sidebar: &str) -> Option<Agent> {
         name: Some(title.into()),
         cwd: Some(cwd.into()),
         agent_session: None,
+        terminal_title: None,
     })
 }
 
@@ -299,6 +316,7 @@ pub fn parse_orca(json: &str, now: SystemTime) -> Result<Vec<Agent>, String> {
             cwd: Some(terminal.worktree_path),
             pane_id: terminal.handle,
             agent_session: None,
+            terminal_title: None,
         })
         .collect())
 }
@@ -365,7 +383,7 @@ impl Host for Auto {
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-fn runner(name: &str, variable: &str) -> Runner {
+pub fn runner(name: &str, variable: &str) -> Runner {
     Runner { binary: find(name, variable), timeout: TIMEOUT }
 }
 
@@ -401,6 +419,7 @@ mod tests {
                     name: None,
                     cwd: Some("/Users/me/code/ops".into()),
                     agent_session: Some(Session { value: "5536".into() }),
+                    terminal_title: None,
                 },
                 Agent {
                     pane_id: "w7:p1".into(),
@@ -408,6 +427,7 @@ mod tests {
                     name: Some("amazon-export".into()),
                     cwd: None,
                     agent_session: None,
+                    terminal_title: None,
                 },
             ]
         );

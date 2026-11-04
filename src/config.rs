@@ -73,15 +73,29 @@ pub struct Watch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Park {
+    pub after: Duration,
+    pub skip: Vec<Target>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub host: String,
     pub jobs: Vec<Job>,
     pub watches: Vec<Watch>,
+    pub park: Option<Park>,
+}
+
+impl Config {
+    pub fn never_parked(&self) -> Vec<Target> {
+        let skip = self.park.iter().flat_map(|park| park.skip.iter().cloned());
+        skip.chain(self.watches.iter().filter_map(|watch| watch.investigator.clone())).collect()
+    }
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { host: "auto".into(), jobs: vec![], watches: vec![] }
+        Config { host: "auto".into(), jobs: vec![], watches: vec![], park: None }
     }
 }
 
@@ -139,6 +153,19 @@ fn five_minutes() -> String {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawPark {
+    #[serde(default = "thirty_minutes")]
+    after: String,
+    #[serde(default)]
+    skip: Vec<Target>,
+}
+
+fn thirty_minutes() -> String {
+    "30m".into()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default = "auto")]
     host: String,
@@ -146,6 +173,7 @@ struct RawConfig {
     job: Vec<RawJob>,
     #[serde(default)]
     watch: Vec<RawWatch>,
+    park: Option<RawPark>,
 }
 
 fn auto() -> String {
@@ -267,6 +295,15 @@ fn watch(raw: RawWatch) -> Result<Watch, String> {
     })
 }
 
+fn park(raw: RawPark) -> Result<Park, String> {
+    let after = humantime::parse_duration(&raw.after)
+        .map_err(|e| format!("park: after = {:?} is not a duration ({e})", raw.after))?;
+    if after < SHORTEST {
+        return Err("park: after must be at least 1m".into());
+    }
+    Ok(Park { after, skip: raw.skip })
+}
+
 fn unique<'a>(names: impl Iterator<Item = &'a str>) -> Result<(), String> {
     let mut names: Vec<&str> = names.collect();
     names.sort_unstable();
@@ -284,7 +321,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let jobs = raw.job.into_iter().map(job).collect::<Result<Vec<_>, _>>()?;
     let watches = raw.watch.into_iter().map(watch).collect::<Result<Vec<_>, _>>()?;
     unique(jobs.iter().map(|j| j.name.as_str()).chain(watches.iter().map(|w| w.name.as_str())))?;
-    Ok(Config { host: raw.host, jobs, watches })
+    let park = raw.park.map(park).transpose()?;
+    Ok(Config { host: raw.host, jobs, watches, park })
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -478,6 +516,31 @@ message = "Someone is gaming tonight."
     fn a_job_and_a_watch_cannot_share_a_name() {
         let text = "[[job]]\nname = \"x\"\nevery = \"5m\"\ntarget = { agent = \"a\" }\nmessage = \"m\"\n[[watch]]\nname = \"x\"\ncpu = 80\n";
         assert_eq!(parse(text).unwrap_err(), "two jobs or watches are named x");
+    }
+
+    #[test]
+    fn parking_is_off_until_a_park_table_turns_it_on_and_never_parks_skipped_agents_or_investigators() {
+        let text = r#"
+[park]
+after = "45m"
+skip = [{ agent = "deploys" }]
+
+[[watch]]
+name = "overload"
+cpu = 85
+investigator = { cwd = "/code/homelab" }
+"#;
+        let config = parse(text).unwrap();
+
+        assert_eq!(parse("").unwrap().park, None);
+        assert_eq!(parse("[park]\n").unwrap().park, Some(Park { after: Duration::from_secs(30 * 60), skip: vec![] }));
+        assert_eq!(config.park.as_ref().map(|park| park.after), Some(Duration::from_secs(45 * 60)));
+        assert_eq!(config.never_parked(), [Target::Agent("deploys".into()), Target::Cwd("/code/homelab".into())]);
+        assert_eq!(parse("[park]\nafter = \"10s\"\n").unwrap_err(), "park: after must be at least 1m");
+        assert!(
+            parse("[park]\nafter = \"later\"\n").unwrap_err().starts_with("park: after = \"later\" is not a duration")
+        );
+        assert!(parse("[park]\nwindow = \"30m\"\n").is_err());
     }
 
     #[test]
