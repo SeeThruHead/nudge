@@ -132,8 +132,8 @@ each Herdr server every 5 seconds and puts any that is not in the background bac
 It checks each task's base priority: `ps` shows a process's busiest thread, and a thread in a background
 process can run higher for a moment while the kernel boosts it to serve a higher-priority waiter, which is
 not an escape. A Herdr
-server is a `herdr` process whose parent is launchd, or the Herdr app's `herdr-core serve` and `herdr-core hold`
-(the holders run the app's terminals); the servers themselves and anything outside them are left alone.
+server is a `herdr` process whose parent is launchd, or a `herdr-core` process whose parent is launchd
+(the Herdr app's core, which runs its terminals); the servers themselves and anything outside them are left alone.
 
 ## Freeze heavy work while someone is using the Mac (macOS)
 
