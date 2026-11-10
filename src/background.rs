@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 pub const SERVER: &str = "herdr";
+pub const CORE: &str = "herdr-core";
+const CORE_ROLES: [&str; 2] = ["serve", "hold"];
 pub const BACKGROUND_PRIORITY: i32 = 4;
 const DEEPEST: usize = 64;
 
@@ -19,8 +21,13 @@ pub trait Processes {
     fn to_background(&self, pid: u32) -> Result<(), String>;
 }
 
+fn is_core(process: &Process) -> bool {
+    process.name == CORE && process.command.get(1).is_some_and(|role| CORE_ROLES.contains(&role.as_str()))
+}
+
 fn is_server(process: &Process) -> bool {
-    process.name == SERVER && process.parent.is_none_or(|parent| parent <= 1)
+    let detached = process.parent.is_none_or(|parent| parent <= 1);
+    detached && (process.name == SERVER || is_core(process))
 }
 
 fn under(process: &Process, parents: &HashMap<u32, Option<u32>>, servers: &HashSet<u32>) -> bool {
@@ -250,6 +257,24 @@ mod tests {
 
         assert_eq!(found.servers, 2);
         assert_eq!(found.under.iter().map(|process| process.pid).collect::<Vec<_>>(), [11, 12, 13, 14, 15, 41]);
+    }
+
+    #[test]
+    fn counts_the_herdr_app_core_holders_as_servers_but_not_its_clients() {
+        let core = |pid: u32, parent: u32, role: &str| Process {
+            command: vec!["/Users/me/.local/share/herdr-core/current/Contents/MacOS/herdr-core".into(), role.into()],
+            ..process(pid, parent, "herdr-core")
+        };
+        let found = tree(&[
+            core(50, 1, "hold"),
+            process(51, 50, "zsh"),
+            process(52, 51, "claude"),
+            core(60, 1, "serve"),
+            core(70, 51, "connect"),
+        ]);
+
+        assert_eq!(found.servers, 2);
+        assert_eq!(found.under.iter().map(|p| p.pid).collect::<Vec<_>>(), [51, 52, 70]);
     }
 
     #[test]

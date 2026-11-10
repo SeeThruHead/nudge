@@ -76,16 +76,35 @@ fn label(binary: &Path, args: &[&str]) -> String {
     std::iter::once(name).chain(args.iter().take(2).map(|arg| arg.to_string())).collect::<Vec<_>>().join(" ")
 }
 
+const TEXT_FILE_BUSY: i32 = 26;
+const SPAWN_TRIES: u32 = 20;
+
 impl Runner {
+    fn spawn(&self, args: &[&str], piped: bool) -> Result<std::process::Child, String> {
+        let attempt = || {
+            Command::new(&self.binary)
+                .args(args)
+                .stdin(if piped { Stdio::piped() } else { Stdio::null() })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        };
+        let busy = |result: &std::io::Result<std::process::Child>| {
+            result.as_ref().err().is_some_and(|e| e.raw_os_error() == Some(TEXT_FILE_BUSY))
+        };
+        let settled = (1..SPAWN_TRIES).fold(attempt(), |last, _| {
+            if !busy(&last) {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            attempt()
+        });
+        settled.map_err(|e| format!("could not start {}: {e}", self.binary.display()))
+    }
+
     pub fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
         let what = label(&self.binary, args);
-        let mut child = Command::new(&self.binary)
-            .args(args)
-            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not start {}: {e}", self.binary.display()))?;
+        let mut child = self.spawn(args, stdin.is_some())?;
         if let (Some(text), Some(mut input)) = (stdin, child.stdin.take()) {
             input.write_all(text.as_bytes()).map_err(|e| format!("{what}: could not write its input: {e}"))?;
         }
@@ -136,6 +155,126 @@ impl Host for Herdr {
     }
     fn prompt(&self, pane: &str, text: &str) -> Result<(), String> {
         self.0.run(&["agent", "prompt", pane, text], None).map(|_| ())
+    }
+}
+
+#[derive(Deserialize)]
+struct CoreTerminal {
+    address: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CoreListing {
+    terminals: Vec<CoreTerminal>,
+}
+
+pub fn parse_core(json: &str) -> Result<Vec<Agent>, String> {
+    let listing: CoreListing =
+        serde_json::from_str(json).map_err(|e| format!("hc ls returned something unexpected: {e}"))?;
+    Ok(listing
+        .terminals
+        .into_iter()
+        .filter(|terminal| terminal.agent.is_some() && terminal.state.as_deref() == Some("live"))
+        .map(|terminal| Agent {
+            pane_id: terminal.address,
+            agent_status: terminal.status.unwrap_or_else(|| "unknown".into()),
+            name: terminal.name,
+            cwd: terminal.cwd,
+            agent_session: None,
+            terminal_title: None,
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct CoreForeground {
+    pid: u32,
+}
+
+#[derive(Deserialize)]
+struct CoreDetail {
+    #[serde(default)]
+    foreground: Option<CoreForeground>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSessionFile {
+    session_id: String,
+}
+
+pub fn foreground_pid(json: &str) -> Option<u32> {
+    serde_json::from_str::<CoreDetail>(json).ok()?.foreground.map(|foreground| foreground.pid)
+}
+
+fn claude_session(pid: u32) -> Option<Session> {
+    let text = std::fs::read_to_string(home().join(".claude/sessions").join(format!("{pid}.json"))).ok()?;
+    serde_json::from_str::<ClaudeSessionFile>(&text).ok().map(|file| Session { value: file.session_id })
+}
+
+pub struct HerdrApp(pub Runner);
+
+impl HerdrApp {
+    fn session_of(&self, address: &str) -> Option<Session> {
+        self.0.run(&["get", address, "--json"], None).ok().as_deref().and_then(foreground_pid).and_then(claude_session)
+    }
+}
+
+impl Host for HerdrApp {
+    fn name(&self) -> &str {
+        "herdr-app"
+    }
+    fn agents(&self) -> Result<Vec<Agent>, String> {
+        let listed = parse_core(&self.0.run(&["ls", "--json"], None)?)?;
+        Ok(listed.into_iter().map(|agent| Agent { agent_session: self.session_of(&agent.pane_id), ..agent }).collect())
+    }
+    fn prompt(&self, pane: &str, text: &str) -> Result<(), String> {
+        self.0.run(&["send", pane, text], None).map(|_| ())
+    }
+}
+
+pub fn is_tui_pane(pane: &str) -> bool {
+    pane.contains(':')
+}
+
+pub struct Herdrs {
+    tui: Box<dyn Host>,
+    app: Box<dyn Host>,
+}
+
+impl Herdrs {
+    pub fn new(tui: Box<dyn Host>, app: Box<dyn Host>) -> Herdrs {
+        Herdrs { tui, app }
+    }
+}
+
+impl Host for Herdrs {
+    fn name(&self) -> &str {
+        "herdr+herdr-app"
+    }
+    fn agents(&self) -> Result<Vec<Agent>, String> {
+        match (self.tui.agents(), self.app.agents()) {
+            (Ok(tui), Ok(app)) => Ok(tui.into_iter().chain(app).collect()),
+            (Ok(tui), Err(_)) => Ok(tui),
+            (Err(_), Ok(app)) => Ok(app),
+            (Err(tui), Err(app)) => Err(format!("herdr: {tui}; herdr-app: {app}")),
+        }
+    }
+    fn prompt(&self, pane: &str, text: &str) -> Result<(), String> {
+        if is_tui_pane(pane) {
+            return self.tui.prompt(pane, text);
+        }
+        self.app.prompt(pane, text)
     }
 }
 
@@ -390,13 +529,16 @@ pub fn runner(name: &str, variable: &str) -> Runner {
 pub fn named(choice: &str) -> Result<Box<dyn Host>, String> {
     match choice {
         "herdr" => Ok(Box::new(Herdr(runner("herdr", "NUDGE_HERDR")))),
+        "herdr-app" => Ok(Box::new(HerdrApp(runner("hc", "NUDGE_HC")))),
         "tmux" => Ok(Box::new(Tmux(runner("tmux", "NUDGE_TMUX")))),
         "cmux" => Ok(Box::new(Cmux(runner("cmux", "NUDGE_CMUX")))),
         "orca" => Ok(Box::new(Orca(runner("orca", "NUDGE_ORCA")))),
         "auto" => Ok(Box::new(Auto::new(
-            ["herdr", "cmux", "orca", "tmux"].iter().map(|name| named(name)).collect::<Result<Vec<_>, _>>()?,
+            std::iter::once(Ok(Box::new(Herdrs::new(named("herdr")?, named("herdr-app")?)) as Box<dyn Host>))
+                .chain(["cmux", "orca", "tmux"].iter().map(|name| named(name)))
+                .collect::<Result<Vec<_>, _>>()?,
         ))),
-        other => Err(format!("host = {other:?} is not one of auto, herdr, tmux, cmux, orca")),
+        other => Err(format!("host = {other:?} is not one of auto, herdr, herdr-app, tmux, cmux, orca")),
     }
 }
 
@@ -432,6 +574,70 @@ mod tests {
             ]
         );
         assert!(parse_herdr("{}").unwrap_err().starts_with("herdr agent list returned something unexpected"));
+    }
+
+    #[test]
+    fn reads_the_live_agent_terminals_herdr_core_lists() {
+        let json = r#"{"hidden_finished":0,"terminals":[
+            {"address":"t5","agent":"claude-code","cwd":"/code/app","state":"live","status":"idle","turn":0,"where":"app / 1"},
+            {"address":"t6","cwd":"/code/app","state":"live","status":null,"turn":0},
+            {"address":"t7","agent":"codex","name":"reviewer","cwd":"/code/site","state":"live","status":"working"},
+            {"address":"t8","agent":"claude-code","cwd":"/code/old","state":"finished","status":"idle"}]}"#;
+
+        assert_eq!(
+            parse_core(json).unwrap(),
+            vec![
+                Agent {
+                    pane_id: "t5".into(),
+                    agent_status: "idle".into(),
+                    name: None,
+                    cwd: Some("/code/app".into()),
+                    agent_session: None,
+                    terminal_title: None,
+                },
+                Agent {
+                    pane_id: "t7".into(),
+                    agent_status: "working".into(),
+                    name: Some("reviewer".into()),
+                    cwd: Some("/code/site".into()),
+                    agent_session: None,
+                    terminal_title: None,
+                },
+            ]
+        );
+        assert!(parse_core("{}").unwrap_err().starts_with("hc ls returned something unexpected"));
+        assert_eq!(foreground_pid(r#"{"address":"t5","foreground":{"name":"claude","pid":4242}}"#), Some(4242));
+        assert_eq!(foreground_pid(r#"{"address":"t5"}"#), None);
+    }
+
+    #[test]
+    fn herdr_app_sends_through_hc() {
+        let ok =
+            HerdrApp(script("hc", r#"[ "$1 $2 $3" = "send t5 check encoding" ] || { echo "got $*" >&2; exit 1; }"#));
+        assert_eq!(ok.prompt("t5", "check encoding"), Ok(()));
+    }
+
+    #[test]
+    fn both_herdrs_list_together_and_each_pane_goes_to_its_own() {
+        let tui = Herdr(script(
+            "herdr",
+            r#"[ "$1" = agent ] && [ "$2" = list ] && { echo '{"result":{"agents":[{"pane_id":"w1:p1","agent_status":"idle"}]}}'; exit 0; }
+               [ "$3" = "w1:p1" ] || { echo "tui got $*" >&2; exit 1; }"#,
+        ));
+        let app = HerdrApp(script(
+            "hc",
+            r#"[ "$1" = ls ] && { echo '{"terminals":[{"address":"t5","agent":"claude-code","state":"live","status":"idle"}]}'; exit 0; }
+               [ "$1" = get ] && exit 1
+               [ "$2" = t5 ] || { echo "app got $*" >&2; exit 1; }"#,
+        ));
+        let both = Herdrs::new(Box::new(tui), Box::new(app));
+        let only_app = Herdrs::new(Box::new(Down), Box::new(HerdrApp(script("hc", r#"echo '{"terminals":[]}'"#))));
+
+        assert_eq!(both.agents().unwrap().iter().map(|a| a.pane_id.as_str()).collect::<Vec<_>>(), ["w1:p1", "t5"]);
+        assert_eq!(both.prompt("w1:p1", "x"), Ok(()));
+        assert_eq!(both.prompt("t5", "x"), Ok(()));
+        assert_eq!(only_app.agents(), Ok(vec![]));
+        assert!(Herdrs::new(Box::new(Down), Box::new(Down)).agents().unwrap_err().contains("herdr-app: not running"));
     }
 
     #[test]

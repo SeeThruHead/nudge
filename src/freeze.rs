@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const NEVER: [&str; 11] =
-    ["claude", "herdr", "nudge", "zsh", "bash", "sh", "fish", "dash", "login", "tmux", "caffeinate"];
+const NEVER: [&str; 12] =
+    ["claude", "herdr", "herdr-core", "nudge", "zsh", "bash", "sh", "fish", "dash", "login", "tmux", "caffeinate"];
 const ARGUMENTS_LOOKED_AT: usize = 3;
 const INTERPRETERS: [&str; 7] = ["python", "python3", "node", "bun", "deno", "ruby", "perl"];
 const EVENTS_KEPT: usize = 20;

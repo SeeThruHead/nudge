@@ -9,12 +9,15 @@ It reaches agents where they already run:
 | Host     | Finds agents by                                                          | Sends with                                 |
 | -------- | ------------------------------------------------------------------------ | ------------------------------------------ |
 | `herdr`  | `herdr agent list` (status, folder, name, session)                       | `herdr agent prompt`                       |
+| `herdr-app` | `hc ls --json` (live terminals with an agent: status, folder, name; the Claude session from `hc get` and `~/.claude/sessions`) | `hc send` |
 | `cmux`   | each workspace's sidebar state (Claude Code, Codex, OpenCode, Gemini)    | a bracketed paste, then Enter              |
 | `orca`   | `orca terminal list --json` (terminals with an agent identity)           | `orca terminal send --enter`               |
 | `tmux`   | panes running a known agent (`claude`, `codex`, `opencode`, `gemini`, `pi`, `amp`, `aider`, `cursor-agent`, plus `NUDGE_AGENT_COMMANDS`) | a bracketed paste, then Enter |
 | `claude` | no multiplexer: `claude -p` in a session (`--resume`) or folder (`--continue`) | a headless Claude Code turn            |
 
-`host = "auto"` (the default) uses the first of herdr, cmux, orca and tmux that answers. A job with
+`host = "auto"` (the default) uses the Herdr TUI and the Herdr desktop app together (agents from both, each
+message sent through the one that runs the agent: TUI panes look like `w1:p2`, app terminals like `t7`), and
+when neither answers, the first of cmux, orca and tmux that does. A job with
 `via = "claude"` skips the host and runs Claude Code directly.
 
 A busy agent is waited for, never interrupted: the message goes out once it is idle. tmux cannot tell whether
@@ -36,7 +39,7 @@ Or build it: `cargo install --locked --path .`, then run `nudge run` under launc
 without a restart.
 
 ```toml
-host = "auto"                                  # or herdr, tmux, cmux, orca
+host = "auto"                                  # or herdr, herdr-app, tmux, cmux, orca
 
 [[job]]
 name = "ci-check"
@@ -97,7 +100,7 @@ on a Mac and the share of RAM not available on Linux.
 
 ## Park idle Claude agents
 
-An idle Claude Code session still holds a few hundred MB. With `[park]`, an agent in Herdr that has been
+An idle Claude Code session still holds a few hundred MB. With `[park]`, an agent in the Herdr TUI that has been
 `idle` or `done` for `after` is parked: nudge records its pane, name, folder and session in
 `~/.local/state/nudge/park.json`, sends `/exit`, waits for the shell, and runs a small placeholder in the pane
 (a copy of nudge named `claude` in `~/.local/share/nudge/parked`, a few MB). Herdr keeps listing it as an idle
@@ -115,6 +118,9 @@ its prompt box, or when `skip` or a watch's
 investigator names it. Other children of Claude, such as the MCP and language servers it starts from
 `.mcp.json` and plugins, do not count; any still running once Claude has exited are closed. Overload warnings and all-clears skip parked agents, since they are not using the machine.
 
+Parking is for the Herdr TUI only. In the Herdr desktop app, idle Claude sessions are put to sleep and woken by
+the app's own Threads panel, so nudge leaves app agents alone.
+
 ## Keep agents' work in the background (macOS)
 
 A Herdr pane shell can put itself in the background (`taskpolicy -b -p $$` in `.zshrc`), so agents and what
@@ -126,7 +132,8 @@ each Herdr server every 5 seconds and puts any that is not in the background bac
 It checks each task's base priority: `ps` shows a process's busiest thread, and a thread in a background
 process can run higher for a moment while the kernel boosts it to serve a higher-priority waiter, which is
 not an escape. A Herdr
-server is a `herdr` process whose parent is launchd; the server itself and anything outside it are left alone.
+server is a `herdr` process whose parent is launchd, or the Herdr app's `herdr-core serve` and `herdr-core hold`
+(the holders run the app's terminals); the servers themselves and anything outside them are left alone.
 
 ## Freeze heavy work while someone is using the Mac (macOS)
 
@@ -135,7 +142,7 @@ or mouse used within `active_within`, from `HIDIdleTime`) and the 1-minute load 
 is under `memory_free`, `nudge run` stops (SIGSTOP) the heavy processes under each Herdr server and everything
 they started: vitest, tsc, tsgo, tsgolint, oxlint, Playwright, Chrome, Chromium and chrome-headless-shell,
 cargo, rustc, clippy-driver, `bun test` and moon. It continues them (SIGCONT) once nobody has used the Mac for
-`active_within`, or load and memory have stayed under the limits for `thaw_after`. Claude, herdr, shells and
+`active_within`, or load and memory have stayed under the limits for `thaw_after`. Claude, herdr, herdr-core, shells and
 nudge itself are never stopped, nor anything outside Herdr. Frozen work just waits, but a command with a
 wall-clock timeout (a Claude Bash call, `timeout`) can run out while frozen.
 

@@ -69,9 +69,10 @@ usage:
   nudge --version
 
 config: $NUDGE_CONFIG, or ~/.config/nudge/config.toml
-hosts:  herdr, tmux, cmux or orca (host = \"auto\" uses the first that answers), or claude -p for via = \"claude\"
+hosts:  herdr (the TUI), herdr-app (the desktop app, through hc), tmux, cmux or orca (host = \"auto\" uses both
+        Herdrs together, else the first that answers), or claude -p for via = \"claude\"
 binaries are found on PATH, ~/.local/bin, /opt/homebrew/bin and /usr/local/bin, or set
-NUDGE_HERDR, NUDGE_TMUX, NUDGE_CMUX, NUDGE_ORCA, NUDGE_CLAUDE";
+NUDGE_HERDR, NUDGE_HC, NUDGE_TMUX, NUDGE_CMUX, NUDGE_ORCA, NUDGE_CLAUDE";
 
 fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()

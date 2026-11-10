@@ -244,7 +244,7 @@ fn auto() -> String {
     "auto".into()
 }
 
-const HOSTS: [&str; 5] = ["auto", "herdr", "tmux", "cmux", "orca"];
+const HOSTS: [&str; 6] = ["auto", "herdr", "herdr-app", "tmux", "cmux", "orca"];
 
 const SHORTEST: Duration = Duration::from_secs(60);
 
