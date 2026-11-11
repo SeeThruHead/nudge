@@ -111,7 +111,6 @@ pub struct Config {
     pub jobs: Vec<Job>,
     pub watches: Vec<Watch>,
     pub park: Option<Park>,
-    pub background: bool,
     pub freeze: Freeze,
 }
 
@@ -129,14 +128,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config {
-            host: "auto".into(),
-            jobs: vec![],
-            watches: vec![],
-            park: None,
-            background: true,
-            freeze: Freeze::default(),
-        }
+        Config { host: "auto".into(), jobs: vec![], watches: vec![], park: None, freeze: Freeze::default() }
     }
 }
 
@@ -221,13 +213,6 @@ struct RawFreeze {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawBackground {
-    #[serde(default = "yes")]
-    enabled: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default = "auto")]
     host: String,
@@ -236,7 +221,8 @@ struct RawConfig {
     #[serde(default)]
     watch: Vec<RawWatch>,
     park: Option<RawPark>,
-    background: Option<RawBackground>,
+    #[serde(rename = "background")]
+    _retired_background: Option<toml::Value>,
     freeze: Option<RawFreeze>,
 }
 
@@ -411,9 +397,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let watches = raw.watch.into_iter().map(watch).collect::<Result<Vec<_>, _>>()?;
     unique(jobs.iter().map(|j| j.name.as_str()).chain(watches.iter().map(|w| w.name.as_str())))?;
     let park = raw.park.map(park).transpose()?;
-    let background = raw.background.is_none_or(|background| background.enabled);
     let freeze = freeze(raw.freeze)?;
-    Ok(Config { host: raw.host, jobs, watches, park, background, freeze })
+    Ok(Config { host: raw.host, jobs, watches, park, freeze })
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -635,11 +620,10 @@ investigator = { cwd = "/code/homelab" }
     }
 
     #[test]
-    fn keeps_herdr_processes_in_the_background_unless_turned_off() {
-        assert!(parse("").unwrap().background);
-        assert!(parse("[background]\n").unwrap().background);
-        assert!(!parse("[background]\nenabled = false\n").unwrap().background);
-        assert!(parse("[background]\non = false\n").is_err());
+    fn still_reads_a_config_with_the_retired_background_table_and_ignores_it() {
+        assert_eq!(parse("[background]\n").unwrap(), parse("").unwrap());
+        assert_eq!(parse("[background]\nenabled = false\n").unwrap(), parse("").unwrap());
+        assert_eq!(parse("[background]\nenabled = true\n").unwrap(), parse("").unwrap());
     }
 
     #[test]

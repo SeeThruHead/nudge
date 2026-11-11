@@ -79,9 +79,6 @@ message = "Extra instructions for the investigator."
 after = "30m"                                  # idle or done this long (default 30m)
 skip = [{ cwd = "/Users/me/code/ops" }]        # never park these; investigators are never parked either
 
-[background]                                   # macOS; on unless enabled = false
-enabled = true
-
 [freeze]                                       # macOS; on unless enabled = false; defaults shown
 active_within = "2m"                           # keyboard or mouse used this recently: someone is at the Mac
 load = 10                                      # 1-minute load average; defaults to this machine's core count
@@ -124,29 +121,17 @@ investigator names it. Other children of Claude, such as the MCP and language se
 Parking is for the Herdr TUI only. In the Herdr desktop app, idle Claude sessions are put to sleep and woken by
 the app's own Threads panel, so nudge leaves app agents alone.
 
-## Keep agents' work in the background (macOS)
-
-A Herdr pane shell can put itself in the background (`taskpolicy -b -p $$` in `.zshrc`), so agents and what
-they start yield the CPU to whoever is using the machine. Some launchers drop that policy for what they spawn
-(a vitest run under bun came out at normal priority, with its Chrome). `nudge run` checks every process under
-each Herdr server every 5 seconds and puts any that is not in the background back in it
-(`setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)`, what `taskpolicy -b -p` does), logging what it moved.
-`nudge check` shows how many processes are under Herdr and which are above background base priority now.
-It checks each task's base priority: `ps` shows a process's busiest thread, and a thread in a background
-process can run higher for a moment while the kernel boosts it to serve a higher-priority waiter, which is
-not an escape. A Herdr
-server is a `herdr` process whose parent is launchd, or a `herdr-core` process whose parent is launchd
-(the Herdr app's core, which runs its terminals); the servers themselves and anything outside them are left alone.
-
 ## Freeze heavy work while someone is using the Mac (macOS)
 
-Background priority is not always enough to keep the Mac responsive. While someone is at the Mac (keyboard
+While someone is at the Mac (keyboard
 or mouse used within `active_within`, from `HIDIdleTime`) and the 1-minute load is over `load` or free memory
 is under `memory_free`, `nudge run` stops (SIGSTOP) the heavy processes under each Herdr server and everything
 they started: vitest, tsc, tsgo, tsgolint, oxlint, Playwright, Chrome, Chromium and chrome-headless-shell,
 cargo, rustc, clippy-driver, `bun test` and moon. It continues them (SIGCONT) once nobody has used the Mac for
 `active_within`, or load and memory have stayed under the limits for `thaw_after`. Claude, herdr, herdr-core, shells and
-nudge itself are never stopped, nor anything outside Herdr. Frozen work just waits, but a command with a
+nudge itself are never stopped, nor anything outside Herdr. A Herdr server is a `herdr` process whose
+parent is launchd, or a `herdr-core` process whose parent is launchd (the Herdr app's core, which runs its
+terminals). Frozen work just waits, but a command with a
 wall-clock timeout (a Claude Bash call, `timeout`) can run out while frozen.
 
 Each freeze and thaw is logged and shown in `nudge check`. What is frozen is kept in
@@ -160,7 +145,7 @@ nudge run           read the config, send each job when it is due, check each wa
 nudge send <job>    send one job's message now
 nudge check         show the host, where each job goes and when it runs next, how each watch stands,
                     which agents are parked and when each resting agent parks,
-                    and which processes under Herdr are not in the background
+                    and what freeze sees and has frozen
 nudge wake <agent>  resume a parked agent (by name or pane) with no message
 nudge thaw          continue every process nudge froze
 nudge --version

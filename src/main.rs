@@ -1,10 +1,10 @@
-mod background;
 mod claude;
 mod config;
 mod freeze;
 mod host;
 mod park;
 mod parked;
+mod processes;
 mod sampler;
 mod schedule;
 mod watch;
@@ -61,11 +61,10 @@ usage:
                       watch's CPU, memory and load limits, telling the agents when one trips or clears
   nudge send <job>    send one job's message now
   nudge check         read the config, show the host, where each job goes and when, how each watch stands,
-                      which agents are parked and when each resting agent parks, and which processes
-                      under Herdr are not in the background
+                      which agents are parked and when each resting agent parks, and whether heavy
+                      work under Herdr is frozen
   nudge wake <agent>  resume a parked agent (by name or pane) with no message
   nudge thaw          continue every process nudge froze (if nudge run is not running to do it)
-                      (nudge run also keeps every process under the Herdr server in the background, on macOS)
   nudge --version
 
 config: $NUDGE_CONFIG, or ~/.config/nudge/config.toml
@@ -125,8 +124,7 @@ fn run() -> ExitCode {
     let park_path = park::state_path(&state_dir());
     let mut parker = Parker::new(park::load(&park_path));
     let (parking_host, parking_panes) = (herdr(), panes());
-    let mut enforcer = background::Enforcer::default();
-    let mut machine = background::Machine::new();
+    let mut machine = processes::Machine::new();
     let freeze_path = freeze::state_path(&state_dir());
     let mut freezer = freeze::Freezer::new(freeze::load(&freeze_path));
     let me = std::process::id();
@@ -134,7 +132,7 @@ fn run() -> ExitCode {
     log(&format!("started, reading {}", path.display()));
     let left_frozen = freezer.state.clone();
     freezer
-        .thaw_all(SystemTime::now(), &background::Processes::list(&mut machine), &freeze::Kill, "nudge started")
+        .thaw_all(SystemTime::now(), &machine.list(), &freeze::Kill, "nudge started")
         .iter()
         .for_each(|line| log(line));
     save_freeze(&freeze_path, &left_frozen, &freezer.state);
@@ -162,7 +160,7 @@ fn run() -> ExitCode {
             }
         }
         let now = SystemTime::now();
-        let listed = if background::SUPPORTED { background::Processes::list(&mut machine) } else { vec![] };
+        let listed = if freeze::SUPPORTED { machine.list() } else { vec![] };
         if freeze::SUPPORTED {
             let before = freezer.state.clone();
             freezer
@@ -178,9 +176,6 @@ fn run() -> ExitCode {
                 .iter()
                 .for_each(|line| log(line));
         }
-        if current.background && background::SUPPORTED {
-            enforcer.tick(&listed, &machine).iter().for_each(|line| log(line));
-        }
         if let Some(park) = &current.park {
             let before = parker.state.clone();
             parker
@@ -193,7 +188,7 @@ fn run() -> ExitCode {
         }
         if stopping_within(TICK) {
             let before = freezer.state.clone();
-            let listed = background::Processes::list(&mut machine);
+            let listed = machine.list();
             freezer
                 .thaw_all(SystemTime::now(), &listed, &freeze::Kill, "nudge stopping")
                 .iter()
@@ -288,7 +283,6 @@ fn check() -> ExitCode {
         );
     });
     check_parking(&config);
-    check_background(&config);
     check_freeze(&config);
     ExitCode::SUCCESS
 }
@@ -328,33 +322,6 @@ fn check_parking(config: &Config) {
         };
         println!("  resting: {} ({}) since {}, {parks}", resting.name, resting.pane, when(park::moment(resting.since)));
     });
-}
-
-fn check_background(config: &Config) {
-    if !config.background {
-        println!("background: off ([background] enabled = false)");
-        return;
-    }
-    if !background::SUPPORTED {
-        println!("background: on, but background policy is macOS only, so nothing is changed here");
-        return;
-    }
-    let mut machine = background::Machine::new();
-    let tree = background::tree(&background::Processes::list(&mut machine));
-    let escaped = background::escaped(&tree, &machine);
-    let state = match escaped.as_slice() {
-        [] => {
-            "all at background base priority (4); ps can still show a single thread briefly boosted higher".to_string()
-        }
-        some => {
-            format!(
-                "{} above background base priority now (nudge run moves them): {}",
-                some.len(),
-                background::described(some)
-            )
-        }
-    };
-    println!("background: on, {} processes under {} herdr servers, {state}", tree.under.len(), tree.servers);
 }
 
 fn check_freeze(config: &Config) {
@@ -399,9 +366,8 @@ fn thaw() -> ExitCode {
     let path = freeze::state_path(&state_dir());
     let mut freezer = freeze::Freezer::new(freeze::load(&path));
     let before = freezer.state.clone();
-    let mut machine = background::Machine::new();
-    let lines =
-        freezer.thaw_all(SystemTime::now(), &background::Processes::list(&mut machine), &freeze::Kill, "nudge thaw");
+    let mut machine = processes::Machine::new();
+    let lines = freezer.thaw_all(SystemTime::now(), &machine.list(), &freeze::Kill, "nudge thaw");
     save_freeze(&path, &before, &freezer.state);
     match lines.as_slice() {
         [] => println!("nothing is frozen"),

@@ -1,5 +1,5 @@
-use crate::background::{Process, tree};
 use crate::config::Freeze;
+use crate::processes::{Process, tree};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
