@@ -1,12 +1,12 @@
 [package]
 name = "nudge"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
-description = "Schedules prompts to coding agents in Herdr, tmux, cmux, Orca or Claude Code, and tells them to back off when the machine is overloaded"
+description = "Sends messages to coding agents in Herdr, on a schedule or on demand"
 license = "MIT"
 repository = "https://github.com/SeeThruHead/nudge"
 readme = "README.md"
-keywords = ["agents", "scheduler", "claude", "tmux", "cron"]
+keywords = ["agents", "scheduler", "herdr", "cron"]
 publish = false
 
 [dependencies]
@@ -15,7 +15,6 @@ croner = "2"
 humantime = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 toml = "0.9"
 
 [profile.release]
