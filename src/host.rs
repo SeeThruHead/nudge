@@ -128,9 +128,23 @@ impl Runner {
     }
 }
 
+const SHELLS: [&str; 11] = ["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "nu", "pwsh", "powershell", "xonsh"];
+
+fn runs_an_agent(program: Option<&str>) -> bool {
+    program.is_some_and(|program| !program.is_empty() && !SHELLS.contains(&program))
+}
+
+#[derive(Deserialize)]
+struct HerdrPane {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(flatten)]
+    pane: Agent,
+}
+
 #[derive(Deserialize)]
 struct HerdrAgents {
-    agents: Vec<Agent>,
+    agents: Vec<HerdrPane>,
 }
 
 #[derive(Deserialize)]
@@ -140,7 +154,15 @@ struct HerdrListing {
 
 pub fn parse_herdr(json: &str) -> Result<Vec<Agent>, String> {
     serde_json::from_str::<HerdrListing>(json)
-        .map(|listing| listing.result.agents)
+        .map(|listing| {
+            listing
+                .result
+                .agents
+                .into_iter()
+                .filter(|pane| runs_an_agent(pane.agent.as_deref()))
+                .map(|pane| pane.pane)
+                .collect()
+        })
         .map_err(|e| format!("herdr agent list returned something unexpected: {e}"))
 }
 
@@ -184,7 +206,7 @@ pub fn parse_core(json: &str) -> Result<Vec<Agent>, String> {
     Ok(listing
         .terminals
         .into_iter()
-        .filter(|terminal| terminal.agent.is_some() && terminal.state.as_deref() == Some("live"))
+        .filter(|terminal| runs_an_agent(terminal.agent.as_deref()) && terminal.state.as_deref() == Some("live"))
         .map(|terminal| Agent {
             pane_id: terminal.address,
             agent_status: terminal.status.unwrap_or_else(|| "unknown".into()),
@@ -546,6 +568,37 @@ pub fn named(choice: &str) -> Result<Box<dyn Host>, String> {
 mod tests {
     use super::*;
 
+    fn investigator_target(agents: &[Agent]) -> Option<String> {
+        match crate::schedule::pick(&crate::config::Target::Agent("investigator".into()), agents) {
+            crate::schedule::Pick::Ready(agent) => Some(agent.pane_id.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_shell_split_beside_an_agent_in_the_tui_is_never_the_agent_its_name_finds() {
+        let json = r#"{"id":"cli:agent:list","result":{"type":"agent_list","agents":[
+            {"agent_status":"unknown","cwd":"/code/ops","pane_id":"w1:p2","tab_id":"w1:t1","name":"investigator"},
+            {"agent":"zsh","agent_status":"unknown","cwd":"/code/ops","pane_id":"w1:p3","tab_id":"w1:t1","name":"investigator"},
+            {"agent":"claude","agent_status":"idle","cwd":"/code/ops","pane_id":"w1:p1","tab_id":"w1:t1","name":"investigator"}]}}"#;
+        let agents = parse_herdr(json).unwrap();
+
+        assert_eq!(agents.iter().map(|agent| agent.pane_id.as_str()).collect::<Vec<_>>(), vec!["w1:p1"]);
+        assert_eq!(investigator_target(&agents), Some("w1:p1".into()));
+    }
+
+    #[test]
+    fn a_shell_split_beside_an_agent_in_the_app_is_never_the_agent_its_name_finds() {
+        let json = r#"{"hidden_finished":0,"terminals":[
+            {"address":"t9","agent":"zsh","cwd":"/code/ops","state":"live","status":null,"name":"investigator","where":"ops / 1"},
+            {"address":"t8","agent":"claude-code","cwd":"/code/ops","state":"live","status":"idle","name":"investigator","where":"ops / 1"},
+            {"address":"t10","cwd":"/code/ops","state":"live","status":null,"name":"investigator","where":"ops / 1"}]}"#;
+        let agents = parse_core(json).unwrap();
+
+        assert_eq!(agents.iter().map(|agent| agent.pane_id.as_str()).collect::<Vec<_>>(), vec!["t8"]);
+        assert_eq!(investigator_target(&agents), Some("t8".into()));
+    }
+
     #[test]
     fn reads_the_agent_list_herdr_prints() {
         let json = r#"{"id":"cli:agent:list","result":{"type":"agent_list","agents":[
@@ -621,7 +674,7 @@ mod tests {
     fn both_herdrs_list_together_and_each_pane_goes_to_its_own() {
         let tui = Herdr(script(
             "herdr",
-            r#"[ "$1" = agent ] && [ "$2" = list ] && { echo '{"result":{"agents":[{"pane_id":"w1:p1","agent_status":"idle"}]}}'; exit 0; }
+            r#"[ "$1" = agent ] && [ "$2" = list ] && { echo '{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_status":"idle"}]}}'; exit 0; }
                [ "$3" = "w1:p1" ] || { echo "tui got $*" >&2; exit 1; }"#,
         ));
         let app = HerdrApp(script(

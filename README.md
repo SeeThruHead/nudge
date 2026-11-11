@@ -15,6 +15,9 @@ It reaches agents where they already run:
 | `tmux`   | panes running a known agent (`claude`, `codex`, `opencode`, `gemini`, `pi`, `amp`, `aider`, `cursor-agent`, plus `NUDGE_AGENT_COMMANDS`) | a bracketed paste, then Enter |
 | `claude` | no multiplexer: `claude -p` in a session (`--resume`) or folder (`--continue`) | a headless Claude Code turn            |
 
+Under `herdr` and `herdr-app` only terminals with an agent running count. A shell split beside an agent shares
+its tab and name but is never picked, so `{ agent = "name" }` always reaches the agent itself.
+
 `host = "auto"` (the default) uses the Herdr TUI and the Herdr desktop app together (agents from both, each
 message sent through the one that runs the agent: TUI panes look like `w1:p2`, app terminals like `t7`), and
 when neither answers, the first of cmux, orca and tmux that does. A job with
