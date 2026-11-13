@@ -2,9 +2,21 @@
 
 nudge sends messages to coding agents in Herdr, on a schedule or on demand; that is its only job.
 
-A job names an agent (by folder, name or session), a schedule (every 30 minutes, at 09:00, or any cron
-pattern) and a message. nudge waits while the agent is busy and sends the message once it is idle, never
-interrupting it. It reads nothing about the machine and touches no processes.
+A job names an agent (by its address, folder, name or session), a schedule (every 30 minutes, at 09:00, or
+any cron pattern) and a message. nudge waits while the agent is busy and sends the message once it is idle,
+never interrupting it. It reads nothing about the machine and touches no processes.
+
+## Targets
+
+`{ address = "machine/space/name" }` is the one to use when you can. nudge resolves it with
+[reach](https://github.com/SeeThruHead/reach), which gives every agent a stable address (in the Herdr app, the
+Threads mod pins one to each agent; `reach ls` lists them). The message goes to exactly that agent: an asleep
+agent is woken with it, a busy one is waited for. When the address does not resolve (nothing there, more than
+one agent there, the agent ended, or reach is not installed), the job is not sent, nudge logs why and posts one
+notification through `notify`, and tries again a minute later. It never falls back to another agent.
+
+Without reach, `{ cwd }`, `{ agent }` (the terminal name) and `{ session }` still work through the host. A
+target that matches more than one agent is refused the same way, never guessed.
 
 | Host        | Finds agents by                                                                  | Sends with           |
 | ----------- | -------------------------------------------------------------------------------- | -------------------- |
@@ -15,8 +27,8 @@ interrupting it. It reads nothing about the machine and touches no processes.
 message sent through the one that runs the agent (TUI panes look like `w1:p2`, app terminals like `t7`).
 
 Only terminals running an agent count. A shell split beside an agent shares its tab and name but is never
-picked, so `{ agent = "name" }` always reaches the agent itself. A target that matches no agent, or more than
-one, is logged and retried; nothing is guessed.
+picked, so `{ agent = "name" }` always reaches the agent itself. A target that matches no agent is logged and
+retried; one that matches more than one is refused and notified.
 
 ## Install
 
@@ -34,11 +46,12 @@ without a restart.
 
 ```toml
 host = "auto"                                  # or herdr, herdr-app
+notify = ["sth-seat", "notify", "--title", "nudge"]   # optional: a command; the message is added last
 
 [[job]]
 name = "ci-check"
 every = "30m"                                  # at least 1m
-target = { cwd = "/Users/me/code/app" }        # or { agent = "name" }, or { session = "id" }
+target = { address = "laptop/app/app" }        # or { cwd = "..." }, { agent = "name" }, { session = "id" }
 message = "Check CI on main and fix what is red."
 
 [[job]]
@@ -68,8 +81,8 @@ nudge check         show the host, where each job goes and when it runs next
 nudge --version
 ```
 
-Binaries are found on `PATH`, `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`; set `NUDGE_HERDR` or
-`NUDGE_HC` to choose one.
+Binaries are found on `PATH`, `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`; set `NUDGE_HERDR`,
+`NUDGE_HC` or `NUDGE_REACH` to choose one.
 
 ## Run it as a service without Homebrew
 

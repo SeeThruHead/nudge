@@ -5,6 +5,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
+    Address(String),
     Session(String),
     Agent(String),
     Cwd(String),
@@ -13,6 +14,7 @@ pub enum Target {
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Target::Address(address) => write!(f, "{address}"),
             Target::Session(id) => write!(f, "session {id}"),
             Target::Agent(name) => write!(f, "agent {name}"),
             Target::Cwd(cwd) => write!(f, "the agent in {cwd}"),
@@ -52,12 +54,13 @@ pub struct Job {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub host: String,
+    pub notify: Vec<String>,
     pub jobs: Vec<Job>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { host: "auto".into(), jobs: vec![] }
+        Config { host: "auto".into(), notify: vec![], jobs: vec![] }
     }
 }
 
@@ -84,6 +87,8 @@ struct RawJob {
 struct RawConfig {
     #[serde(default = "auto")]
     host: String,
+    #[serde(default)]
+    notify: Vec<String>,
     #[serde(default)]
     job: Vec<RawJob>,
     #[serde(rename = "watch")]
@@ -151,8 +156,21 @@ fn schedule(raw: &mut RawJob) -> Result<Schedule, String> {
     }
 }
 
+fn address(name: &str, target: &Target) -> Result<(), String> {
+    let Target::Address(address) = target else { return Ok(()) };
+    let parts: Vec<&str> = address.split('/').collect();
+    let part = |p: &&str| {
+        !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+    };
+    if (parts.len() == 2 || parts.len() == 3) && parts.iter().all(part) {
+        return Ok(());
+    }
+    Err(format!("job {name}: address = {address:?} is not machine/space/name (lowercase)"))
+}
+
 fn job(mut raw: RawJob) -> Result<Job, String> {
     let schedule = schedule(&mut raw)?;
+    address(&raw.name, &raw.target)?;
     if raw.message.trim().is_empty() {
         return Err(format!("job {}: message is empty", raw.name));
     }
@@ -175,7 +193,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     }
     let jobs = raw.job.into_iter().map(job).collect::<Result<Vec<_>, _>>()?;
     unique(jobs.iter().map(|j| j.name.as_str()))?;
-    Ok(Config { host: raw.host, jobs })
+    Ok(Config { host: raw.host, notify: raw.notify, jobs })
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
@@ -223,6 +241,27 @@ message = "hi"
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reads_an_address_target_and_the_notify_command() {
+        let text = "notify = [\"sth-seat\", \"notify\"]\n[[job]]\nname = \"x\"\nevery = \"5m\"\ntarget = { address = \"sthdev/homelab/homelab\" }\nmessage = \"m\"\n";
+        let config = parse(text).unwrap();
+        assert_eq!(config.jobs[0].target, Target::Address("sthdev/homelab/homelab".into()));
+        assert_eq!(config.notify, vec!["sth-seat".to_string(), "notify".to_string()]);
+    }
+
+    #[test]
+    fn rejects_an_address_that_is_not_machine_space_name() {
+        let job = |address: &str| {
+            format!("[[job]]\nname = \"x\"\nevery = \"5m\"\ntarget = {{ address = \"{address}\" }}\nmessage = \"m\"\n")
+        };
+        assert_eq!(
+            parse(&job("homelab")).unwrap_err(),
+            "job x: address = \"homelab\" is not machine/space/name (lowercase)"
+        );
+        assert!(parse(&job("Home/Lab")).is_err());
+        assert!(parse(&job("homelab/homelab")).is_ok());
     }
 
     #[test]

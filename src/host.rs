@@ -107,6 +107,26 @@ impl Runner {
         child.stderr.take().map(|mut s| s.read_to_string(&mut err));
         if status.success() { Ok(out) } else { Err(format!("{what} failed: {}{}", err.trim(), out.trim())) }
     }
+
+    pub fn run_any(&self, args: &[&str]) -> Result<String, String> {
+        let what = label(&self.binary, args);
+        let mut child = self.spawn(args)?;
+        let started = Instant::now();
+        loop {
+            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+                break;
+            }
+            if started.elapsed() > self.timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{what} took longer than {:?}", self.timeout));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut out = String::new();
+        child.stdout.take().map(|mut s| s.read_to_string(&mut out));
+        Ok(out)
+    }
 }
 
 const SHELLS: [&str; 11] = ["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "nu", "pwsh", "powershell", "xonsh"];
