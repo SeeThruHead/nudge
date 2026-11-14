@@ -37,6 +37,8 @@ brew install seethruhead/tap/nudge
 brew services start seethruhead/tap/nudge
 ```
 
+[sth-update](https://github.com/SeeThruHead/sth-update) keeps it current and restarts the service after each upgrade.
+
 Or build it: `cargo install --locked --path .`, then run `nudge run` under launchd or systemd (see below).
 
 ## Configure
